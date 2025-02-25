@@ -13,7 +13,7 @@ const call_block_info = async (blockNumber) => {
         if (!fs.existsSync(destination)){ fs.mkdirSync(destination);} // make dir when not exist
         const filePath = path.join(destination, `Block_${blockNumber}.txt`);
         
-        fs.writeFileSync(filePath, JSON.stringify(blockInfo.transactions, null, 2));
+        fs.writeFileSync(filePath, JSON.stringify(blockInfo, null, 2));
 
         console.log(`BlockInfo saved to ${filePath}`);
     } catch (error) {
@@ -22,4 +22,5 @@ const call_block_info = async (blockNumber) => {
 };
 
 // The token is deployed in block 10809467
-call_block_info(10809467)
+// call_block_info(10809467)
+call_block_info("latest")
