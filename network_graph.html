@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Ethereum Token Transaction Network Graph</title>
+    <script src="https://d3js.org/d3.v6.min.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            height: 100vh;
+            margin: 0;
+            background-color: #f0f0f0;
+            flex-direction: column;
+        }
+        svg {
+            border: 1px solid #ccc;
+        }
+        .node {
+            cursor: pointer;
+            stroke: #a6d8b5;
+            stroke-width: 1.5px;
+        }
+        .link {
+            fill: none;
+            stroke: #999;
+            stroke-opacity: 0.6;
+        }
+        .tooltip {
+            position: absolute;
+            background: rgba(0, 0, 0, 0.8);
+            color: white;
+            padding: 5px 10px;
+            border-radius: 5px;
+            font-size: 12px;
+            pointer-events: none;
+            visibility: hidden;
+        }
+        h1 {
+            text-align: center;
+            font-size: 24px;
+            margin-bottom: 20px;
+        }
+    </style>
+</head>
+<body>
+
+<h1>CRV交易数据可视化</h1>
+<svg width="960" height="600"></svg>
+<div class="tooltip"></div>
+
+<script>
+    // 加载CSV文件
+    d3.csv("2024_crv_transaction.csv").then(function(data) {
+
+        // 数据准备阶段: 计算每个地址参与的交易次数
+        let nodes = {};
+        let links = [];
+
+        // 遍历交易数据，构建网络图
+        data.forEach(function(d) {
+            links.push({ source: d.From, target: d.To });
+
+            // 统计每个地址的交易次数
+            nodes[d.From] = (nodes[d.From] || 0) + 1;
+            nodes[d.To] = (nodes[d.To] || 0) + 1;
+        });
+
+        // 转换为数组
+        let nodeArray = Object.keys(nodes).map(function(key) {
+            return { id: key, transactions: nodes[key] };
+        });
+
+        // 计算交易次数范围
+        const minTransactions = d3.min(nodeArray, d => d.transactions);
+        const maxTransactions = d3.max(nodeArray, d => d.transactions);
+
+        // 使用对数颜色映射
+        const colorScale = d3.scaleLog()
+            .base(10)
+            .domain([minTransactions, maxTransactions])
+            .range(["#f7fbff", "#08306b"]);  // 使用蓝色到白色的渐变，从低交易次数到高交易次数
+
+        // SVG 画布
+        const width = 960, height = 600;
+        const svg = d3.select("svg")
+            .attr("width", width)
+            .attr("height", height);
+
+        // 缩放和平移（Zoom & Pan）
+        const zoom = d3.zoom()
+            .scaleExtent([0.1, 5]) // 缩放范围
+            .on("zoom", function(event) {
+                g.attr("transform", event.transform);
+            });
+
+        svg.call(zoom);
+
+        const g = svg.append("g");
+
+        // 设置力导向图布局
+        const simulation = d3.forceSimulation(nodeArray)
+            .force("link", d3.forceLink(links).id(d => d.id).distance(100))
+            .force("charge", d3.forceManyBody().strength(-100))
+            .force("center", d3.forceCenter(width / 2, height / 2));
+
+        // 绘制边
+        const link = g.append("g")
+            .selectAll(".link")
+            .data(links)
+            .enter().append("line")
+            .attr("class", "link");
+
+        // 绘制节点
+        const node = g.append("g")
+            .selectAll(".node")
+            .data(nodeArray)
+            .enter().append("circle")
+            .attr("class", "node")
+            .attr("r", d => Math.sqrt(d.transactions) + 5)
+            .attr("fill", d => colorScale(d.transactions)) // 使用对数颜色映射
+            .call(d3.drag()
+                .on("start", dragStarted)
+                .on("drag", dragged)
+                .on("end", dragEnded));
+
+        // Tooltip
+        const tooltip = d3.select(".tooltip");
+
+        node.on("mouseover", function(event, d) {
+            tooltip.style("visibility", "visible")
+                .html(`<strong>地址:</strong> ${d.id}<br><strong>交易次数:</strong> ${d.transactions}`);
+        })
+        .on("mousemove", function(event) {
+            tooltip.style("top", (event.pageY + 10) + "px")
+                .style("left", (event.pageX + 10) + "px");
+        })
+        .on("mouseout", function() {
+            tooltip.style("visibility", "hidden");
+        });
+
+        // 力导向图布局更新
+        simulation.on("tick", function() {
+            link
+                .attr("x1", d => d.source.x)
+                .attr("y1", d => d.source.y)
+                .attr("x2", d => d.target.x)
+                .attr("y2", d => d.target.y);
+
+            node
+                .attr("cx", d => d.x)
+                .attr("cy", d => d.y);
+        });
+
+        // 拖拽事件
+        function dragStarted(event, d) {
+            if (!event.active) simulation.alphaTarget(0.3).restart();
+            d.fx = d.x;
+            d.fy = d.y;
+        }
+
+        function dragged(event, d) {
+            d.fx = event.x;
+            d.fy = event.y;
+        }
+
+        function dragEnded(event, d) {
+            if (!event.active) simulation.alphaTarget(0);
+            d.fx = null;
+            d.fy = null;
+        }
+
+    }).catch(function(error) {
+        console.log("Error loading the CSV file: ", error);
+    });
+</script>
+
+</body>
+</html>
