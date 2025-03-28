@@ -1,82 +1,150 @@
-const axios = require('axios'); 
-const { Web3 } = require('web3');
-const web3 = new Web3("http://10.222.117.105:8545");
+require("dotenv").config();
+const axios = require("axios");
+const { keccak256 } = require("js-sha3");
 
-// 目标合约地址和ABI
-const contractAddress = "0x6c3F90f043a72FA612cbac8115EE7e52BDe6E490";
-const contractABI = [
-    { "constant": false, "inputs": [{"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "transfer", "outputs": [{"name": "", "type": "bool"}], "type": "function" },
-    { "constant": false, "inputs": [{"name": "_from", "type": "address"}, {"name": "_to", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "transferFrom", "outputs": [{"name": "", "type": "bool"}], "type": "function" },
-    { "constant": false, "inputs": [{"name": "_spender", "type": "address"}, {"name": "_value", "type": "uint256"}], "name": "approve", "outputs": [{"name": "", "type": "bool"}], "type": "function" }
-];
-
-const contract = new web3.eth.Contract(contractABI, contractAddress);
-
-async function getLatestBlock() {
-    const latestBlockNumber = await web3.eth.getBlockNumber();
-    return BigInt(latestBlockNumber); // 转换为 BigInt 类型
+const GETH_API = process.env.GETH_API;
+if (!GETH_API) {
+    console.error("Error: GETH_API is not set in .env file");
+    process.exit(1);
 }
 
-// 获取单个区块的交易数据
+const contractAddress = "0x6c3F90f043a72FA612cbac8115EE7e52BDe6E490";
+
+// 辅助函数：将hex转换为大整数
+function hexToBigInt(hex) {
+    return BigInt(hex.startsWith('0x') ? hex : '0x' + hex);
+}
+
+// 辅助函数：将数字转换为hex
+function numberToHex(num) {
+    return '0x' + num.toString(16);
+}
+
+// 将输入数据按32字节(64位hex)分割
+function splitInputData(inputData) {
+    const chunks = [];
+    for (let i = 0; i < inputData.length; i += 64) {
+        chunks.push(inputData.slice(i, i + 64));
+    }
+    return chunks;
+}
+
+// 解码参数
+function decodeParameter(type, value) {
+    if (type === 'address') {
+        return '0x' + value.slice(24); // 取后20字节
+    } else if (type === 'uint256') {
+        return hexToBigInt('0x' + value);
+    }
+    return value;
+}
+
+async function getLatestBlock() {
+    const response = await axios.post(GETH_API, {
+        jsonrpc: "2.0",
+        id: 1,
+        method: "eth_blockNumber",
+        params: []
+    });
+    return hexToBigInt(response.data.result);
+}
+
 async function getBlockTransactions(blockNum) {
     try {
-        const block = await web3.eth.getBlock(blockNum, true);
-        return block?.transactions?.filter(tx => tx.to?.toLowerCase() === contractAddress.toLowerCase()) || [];
+        const response = await axios.post(GETH_API, {
+            jsonrpc: "2.0",
+            id: 1,
+            method: "eth_getBlockByNumber",
+            params: [numberToHex(blockNum), true]
+        });
+        return response.data.result?.transactions?.filter(tx => 
+            tx.to?.toLowerCase() === contractAddress.toLowerCase()
+        ) || [];
     } catch (error) {
         console.error(`Error fetching block ${blockNum}:`, error);
         return [];
     }
 }
 
-// 批量获取区块数据
 async function getTransactions(fromBlock, toBlock) {
     console.log(`Fetching transactions from block ${fromBlock} to ${toBlock}...`);
-    const blockNumbers = Array.from({ length: Number(toBlock - fromBlock + BigInt(1)) }, (_, i) => fromBlock + BigInt(i));
+    const blockNumbers = Array.from(
+        { length: Number(toBlock - fromBlock + BigInt(1)) }, 
+        (_, i) => fromBlock + BigInt(i)
+    );
     const transactions = await Promise.all(blockNumbers.map(getBlockTransactions));
     return transactions.flat();
 }
 
-// 解析交易并提取函数调用
 async function parseTransactions(transactions) {
     const selectors = {
-        transfer: web3.eth.abi.encodeFunctionSignature("transfer(address,uint256)"),
-        transferFrom: web3.eth.abi.encodeFunctionSignature("transferFrom(address,address,uint256)"),
-        approve: web3.eth.abi.encodeFunctionSignature("approve(address,uint256)")
+        transfer: "0x" + keccak256("transfer(address,uint256)").slice(0, 8),
+        transferFrom: "0x" + keccak256("transferFrom(address,address,uint256)").slice(0, 8),
+        approve: "0x" + keccak256("approve(address,uint256)").slice(0, 8)
     };
 
     const parsedTxs = [];
 
     for (const tx of transactions) {
-        if (!tx.input || tx.input === '0x') continue;
+        if (!tx.input || tx.input === "0x") continue;
 
         const methodId = tx.input.slice(0, 10);
-        let decodedParams;
+        const inputData = tx.input.slice(10);
+        const params = splitInputData(inputData);
 
         try {
             if (methodId === selectors.transfer) {
-                decodedParams = web3.eth.abi.decodeParameters(["address", "uint256"], tx.input.slice(10));
-                parsedTxs.push({ function: "transfer", hash: tx.hash, from: tx.from, to: decodedParams[0], value: decodedParams[1] });
+                parsedTxs.push({ 
+                    function: "transfer", 
+                    hash: tx.hash, 
+                    from: tx.from, 
+                    to: decodeParameter('address', params[0]), 
+                    value: decodeParameter('uint256', params[1]).toString()
+                });
+
             } else if (methodId === selectors.transferFrom) {
-                decodedParams = web3.eth.abi.decodeParameters(["address", "address", "uint256"], tx.input.slice(10));
-                parsedTxs.push({ function: "transferFrom", hash: tx.hash, from: decodedParams[0], to: decodedParams[1], value: decodedParams[2], caller: tx.from });
+                parsedTxs.push({ 
+                    function: "transferFrom", 
+                    hash: tx.hash, 
+                    from: decodeParameter('address', params[0]), 
+                    to: decodeParameter('address', params[1]), 
+                    value: decodeParameter('uint256', params[2]).toString(), 
+                    caller: tx.from 
+                });
+
             } else if (methodId === selectors.approve) {
-                decodedParams = web3.eth.abi.decodeParameters(["address", "uint256"], tx.input.slice(10));
-                parsedTxs.push({ function: "approve", hash: tx.hash, from: tx.from, spender: decodedParams[0], value: decodedParams[1] });
+                parsedTxs.push({ 
+                    function: "approve", 
+                    hash: tx.hash, 
+                    from: tx.from, 
+                    spender: decodeParameter('address', params[0]), 
+                    value: decodeParameter('uint256', params[1]).toString()
+                });
             }
         } catch (error) {
             console.error(`Failed to decode tx ${tx.hash}:`, error.message);
         }
     }
 
-    console.log("Parsed Transactions:", parsedTxs);
+    console.log("\nParsed Transactions:");
+    parsedTxs.forEach(tx => {
+        console.log('\nTransaction:', {
+            ...tx,
+            hash: tx.hash,
+            function: tx.function,
+            value: tx.value === '115792089237316195423570985008687907853269984665640564039457584007913129639935' 
+                ? 'MAX_UINT256' 
+                : tx.value
+        });
+    });
+    
     return parsedTxs;
 }
 
-// 主函数
 async function main() {
     try {
         const latestBlock = await getLatestBlock();
-        const fromBlock = latestBlock - BigInt(3000); // 获取最近3000个区块
+        const fromBlock = latestBlock - BigInt(3000);
         const transactions = await getTransactions(fromBlock, latestBlock);
 
         if (transactions.length > 0) {
