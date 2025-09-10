@@ -41,6 +41,7 @@ export async function checkConnection() {
         return false;
     }
 }
+checkConnection();
 
 // Insert with returning ID
 export async function insert(table, data) {
@@ -78,11 +79,31 @@ export async function closePool() {
     console.log('PostgreSQL pool closed');
 }
 
+// check if a table is empty, and get the latest block number
+export async function getMaxBlockNumber(tableName) {
+    const maxBlockNumber = `SELECT MAX(block_number) AS latest_block FROM ${tableName}`;
+    const tableResult = await query(maxBlockNumber);
+    const maxBlock = tableResult.rows[0].latest_block;
+
+    if (maxBlock === null) {
+        return {
+            isEmpty: true,
+            maxBlock: null
+        };
+    } else {
+        return {
+            isEmpty: false,
+            maxBlock: maxBlock
+        };
+    }
+}
+
 export default {
     query,
     checkConnection,
     closePool,
     insert,
     update,
-    remove
+    remove,
+    getMaxBlockNumber
 };

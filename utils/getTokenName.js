@@ -2,17 +2,38 @@ import { ethers } from "ethers";
 import { provider } from './provider.js';
 
 export const getTokenName = async (tokenAddress) => {
-    // ERC20 ABI (minimal for name/symbol)
-    const erc20Abi = [
+    // ERC20 ABI
+    const erc20Abi_string = [
         "function name() external view returns (string)",
         "function symbol() external view returns (string)",
     ];
-    const tokenContract = new ethers.Contract(tokenAddress, erc20Abi, provider);
+    const tokenContract_string = new ethers.Contract(tokenAddress, erc20Abi_string, provider);
+
+    const erc20Abi_byte32 = [
+        "function name() external view returns (bytes32)",
+        "function symbol() external view returns (bytes32)",
+    ];
+    const tokenContract_byte32 = new ethers.Contract(tokenAddress, erc20Abi_byte32, provider);
 
     try {
-        const name = await tokenContract.name();
-        const symbol = await tokenContract.symbol();
-        // console.log(`Token ${tokenAddress} Name: ${name}, Symbol: ${symbol}`);
+        let name, symbol;
+
+        try {
+            name = await tokenContract_string.name();
+            symbol = await tokenContract_string.symbol();
+        } catch (err) {
+            console.warn("Failed to fetch name as string", err);
+            name = null;
+            symbol = null;
+        }
+
+        if (!name || !symbol) {
+
+            const nameBytes = await tokenContract_byte32.name();
+            const symbolBytes = await tokenContract_byte32.symbol();
+            name = ethers.decodeBytes32String(nameBytes);
+            symbol = ethers.decodeBytes32String(symbolBytes);
+        }
 
         return { name, symbol };
     } catch (error) {

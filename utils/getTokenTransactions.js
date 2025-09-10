@@ -1,9 +1,9 @@
 import { provider } from './provider.js';
 import { get_block_info, get_tx_info, get_tx_receipt, find_deployment_block } from './callBlockInfo.js'
 import { getTokenName } from './getTokenName.js'
-import { query, insert } from './postgresql.js';
+import { query, insert, getMaxBlockNumber } from './postgresql.js';
 
-const CONTRACT_ADDRESS = "0x514910771AF9Ca656af840dff83E8264EcF986CA"
+const CONTRACT_ADDRESS = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
 
 // Get token info and create transaction table
 async function setupTokenTable(contractAddress) {
@@ -14,6 +14,7 @@ async function setupTokenTable(contractAddress) {
         const tableName = `${tokenSymbol.toLowerCase()}_transactions`;
 
         // Create table for this token
+        // Todo: add timestamp
         const createTransactionTable = `
             CREATE TABLE IF NOT EXISTS ${tableName} (                        
                 id SERIAL PRIMARY KEY,
@@ -39,12 +40,12 @@ async function setupTokenTable(contractAddress) {
     }
 }
 
-// Store transaction receipt     
+// Store transaction receipt
 async function storeTxReceipt(txHash, contractAddress, tableName) {
     try {
         const receipt = await get_tx_receipt(txHash);
 
-        // Prepare data for insertion           
+        // Prepare data for insertion
         const txData = {
             block_number: Number(receipt.blockNumber),
             transaction_hash: receipt.hash.toString(),
@@ -58,7 +59,7 @@ async function storeTxReceipt(txHash, contractAddress, tableName) {
             logs: JSON.stringify(receipt.logs)
         };
 
-        // Insert into PostgreSQL               
+        // Insert into PostgreSQL
         const result = await insert(tableName, txData);
         console.log(`Stored transaction ${txHash} in block ${receipt.blockNumber}`);
 
@@ -78,12 +79,12 @@ async function scanBlocks(contractAddress, startBlock, endBlock = 'latest', tabl
         let transactionsCount = 0;
         for (let blockNumber = startBlock; blockNumber <= targetEndBlock; blockNumber++) {
             try {
-                const block = await get_block_info(blockNumber);               
+                const block = await get_block_info(blockNumber);
                 if (block && block.transactions) {
                     const txInfos = await Promise.all(
                         block.transactions.map(tx => get_tx_info(tx))
                     );
-                    
+
                     for (let i = 0; i < block.transactions.length; i++) {
                         const tx = block.transactions[i];
                         const txInfo = txInfos[i];
@@ -118,21 +119,43 @@ async function scanBlocks(contractAddress, startBlock, endBlock = 'latest', tabl
 
 async function getTokenTransactions(contractAddress = CONTRACT_ADDRESS) {
     try {
-        // Setup token table            
+        // Setup token table                                                                             
         const tableName = await setupTokenTable(contractAddress);
+        const { isEmpty, maxBlock } = await getMaxBlockNumber(tableName);
 
-        // Find deployment block        
-        const deploymentBlock = await find_deployment_block(contractAddress);
+        console.log(isEmpty, maxBlock);
+        
+        let startBlock;
+        if (isEmpty) {
+            console.log('Table is empty, finding deployment block...');
+            startBlock = await find_deployment_block(contractAddress);
+        } else {
+            console.log(`Table ${tableName} not empty, Latest block: ${maxBlock}`);
+            startBlock = Number(maxBlock) + 1;
+        }
 
-        // Scan until latest block 
+        // Get current block number                                                                      
+        const currentBlock = await provider.getBlockNumber();
+
+        console.log(startBlock);
+        
+        // Only scan if startBlock is not beyond current block                                           
+        if (startBlock > currentBlock) {
+            console.log('No new blocks to scan');
+            return 0;
+        }
+
+        // Scan from startBlock to latest block                                                          
         const transactionsCount = await scanBlocks(
             contractAddress,
-            deploymentBlock,
-            'latest', // Scan to latest block
+            startBlock,
+            'latest',
             tableName
         );
 
-        console.log(`Scan finished, ${transactionsCount} Transactions found`);
+        console.log(`Scan finished, found ${transactionsCount} new transactions`);
+        return transactionsCount;
+
     } catch (error) {
         console.error('Error in getTokenTransactions:', error);
         throw error;
