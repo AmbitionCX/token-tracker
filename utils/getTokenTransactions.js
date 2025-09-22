@@ -3,7 +3,7 @@ import { get_block_info, get_tx_info, get_tx_receipt, find_deployment_block } fr
 import { getTokenName } from './getTokenName.js'
 import { query, insert, getMaxBlockNumber } from './postgresql.js';
 
-const CONTRACT_ADDRESS = "0x9f8F72aA9304c8B593d555F12eF6589cC3A579A2"
+const CONTRACT_ADDRESS = process.argv[2] || null;
 
 // Get token info and create transaction table
 async function setupTokenTable(contractAddress) {
@@ -27,7 +27,8 @@ async function setupTokenTable(contractAddress) {
                 gas_used BIGINT,
                 cumulative_gas_used BIGINT,
                 gas_price BIGINT,
-                logs JSONB
+                logs JSONB,
+                timestamp TIMESTAMP
             )`;
 
         await query(createTransactionTable);
@@ -41,7 +42,7 @@ async function setupTokenTable(contractAddress) {
 }
 
 // Store transaction receipt
-async function storeTxReceipt(txHash, contractAddress, tableName) {
+async function storeTxReceipt(txHash, contractAddress, tableName, timestamp) {
     try {
         const receipt = await get_tx_receipt(txHash);
 
@@ -56,14 +57,13 @@ async function storeTxReceipt(txHash, contractAddress, tableName) {
             gas_used: Number(receipt.gasUsed),
             cumulative_gas_used: Number(receipt.cumulativeGasUsed),
             gas_price: Number(receipt.gasPrice),
-            logs: JSON.stringify(receipt.logs)
+            logs: JSON.stringify(receipt.logs),
+            timestamp: new Date(Number(timestamp) * 1000) // Convert Unix timestamp to JavaScript Date
         };
 
         // Insert into PostgreSQL
-        const result = await insert(tableName, txData);
+        await insert(tableName, txData);
         console.log(`Stored transaction ${txHash} in block ${receipt.blockNumber}`);
-
-        // return result;
     } catch (error) {
         console.error(`Error processing transaction ${txHash}:`, error);
         throw error;
@@ -95,7 +95,7 @@ async function scanBlocks(contractAddress, startBlock, endBlock = 'latest', tabl
                             (txFrom && txFrom.toLowerCase() === contractAddress.toLowerCase()) ||
                             (txTo && txTo.toLowerCase() === contractAddress.toLowerCase())
                         ) {
-                            await storeTxReceipt(tx, contractAddress, tableName);
+                            await storeTxReceipt(tx, contractAddress, tableName, block.timestamp);
                             transactionsCount++;
                         }
                     }
@@ -118,13 +118,16 @@ async function scanBlocks(contractAddress, startBlock, endBlock = 'latest', tabl
 }
 
 async function getTokenTransactions(contractAddress = CONTRACT_ADDRESS) {
+    if (contractAddress == null) {
+        console.error('Error: Contract address is required');
+        process.exit(1);
+    }
+
     try {
         // Setup token table                                                                             
         const tableName = await setupTokenTable(contractAddress);
         const { isEmpty, maxBlock } = await getMaxBlockNumber(tableName);
 
-        console.log(isEmpty, maxBlock);
-        
         let startBlock;
         if (isEmpty) {
             console.log('Table is empty, finding deployment block...');
@@ -136,7 +139,6 @@ async function getTokenTransactions(contractAddress = CONTRACT_ADDRESS) {
 
         // Get current block number                                                                      
         const currentBlock = await provider.getBlockNumber();
-
         console.log(startBlock);
         
         // Only scan if startBlock is not beyond current block                                           
