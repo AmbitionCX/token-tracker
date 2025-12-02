@@ -1,0 +1,7 @@
+eth-abi
+eth-utils
+requests
+sqlalchemy
+python-dotenv
+psycopg2
+pandas
