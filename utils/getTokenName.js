@@ -35,6 +35,17 @@ export const getTokenName = async (tokenAddress) => {
             symbol = ethers.decodeBytes32String(symbolBytes);
         }
 
+        // 3crv -> crv3, to create table in postgresql
+        if (symbol) {
+            const match = symbol.match(/^(\d+)(.*)$/);
+            if (match) {
+            const leadingDigits = match[1]; // leading numbers
+            const rest = match[2];           // the rest
+            symbol = rest + leadingDigits;   // reverse the number and other string
+            symbol = symbol.toLowerCase();
+            }
+        }
+
         return { name, symbol };
     } catch (error) {
         console.error('ERC20 token error:', error);
@@ -42,6 +53,7 @@ export const getTokenName = async (tokenAddress) => {
     }
 }
 
+getTokenName("0x6c3F90f043a72FA612cbac8115EE7e52BDe6E490").then(r => console.log(r))
 export const getSwapPair = async (swapAddress) => {
 
     // Contract address and ABI (minimal ABI for the public variables)

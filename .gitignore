@@ -130,4 +130,6 @@ dist
 .pnp.*
 
 Results
+function_sequence.csv
 .aider*
+__pycache__
