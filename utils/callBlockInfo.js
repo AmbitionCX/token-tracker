@@ -88,28 +88,24 @@ export const store_tx_receipt = async (txHash) => {
 export const find_deployment_block = async (contractAddress) => {
     try {
         const apiKey = process.env.ETHERSCAN_API_KEY;
-        const base_url = process.env.ETHERSCAN_API_URL;
 
-        const etherscan_api_url = `${base_url}&module=contract&action=getcontractcreation&contractaddresses=${contractAddress}&apikey=${apiKey}`;
-        const response = await axios.get(etherscan_api_url, { timeout: 15000 });
+        const url =
+          `https://api.etherscan.io/v2/api` +
+          `?chainid=1` +
+          `&module=contract` +
+          `&action=getcontractcreation` +
+          `&contractaddresses=${contractAddress}` +
+          `&apikey=${apiKey}`;
 
-        // response structure
-        // [
-        //   {
-        //     contractAddress: '',
-        //     contractCreator: '',
-        //     txHash: '',
-        //     blockNumber: '',
-        //     timestamp: '',
-        //     contractFactory: '',
-        //     creationBytecode: ''
-        //   }
-        // ]
+        const response = await axios.get(url, { timeout: 15000 });
 
-        const block_number = response.data.result[0].blockNumber;
-        return Number(block_number);
-    } catch (error) {
-        console.log(error);
-        throw error;
+        if (response.data.status !== "1") {
+            throw new Error(response.data.result);
+        }
+
+        return Number(response.data.result[0].blockNumber);
+    } catch (err) {
+        console.error("Error fetching deployment block:", err.message);
+        throw err;
     }
-}
+};
