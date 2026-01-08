@@ -1,167 +1,175 @@
 import { provider } from './provider.js';
-import { get_block_info, get_tx_info, get_tx_receipt, find_deployment_block } from './callBlockInfo.js'
-import { getTokenName } from './getTokenName.js'
+import {
+    get_tx_receipt,
+    find_deployment_block
+} from './callBlockInfo.js';
+import { getTokenName } from './getTokenName.js';
 import { query, insert, getMaxBlockNumber } from './postgresql.js';
 
 const CONTRACT_ADDRESS = process.argv[2] || null;
 
-// Get token info and create transaction table
+/* =========================
+   建表
+========================= */
 async function setupTokenTable(contractAddress) {
-    try {
-        // Get token name and symbol
-        const { name: tokenName, symbol: tokenSymbol } = await getTokenName(contractAddress);
-        console.log(`Token: ${tokenName} (${tokenSymbol})`);
-        const tableName = `${tokenSymbol.toLowerCase()}_transactions`;
+    const { name, symbol } = await getTokenName(contractAddress);
+    console.log(`Token: ${name} (${symbol})`);
 
-        // Create table for this token
-        // Todo: add timestamp
-        const createTransactionTable = `
-            CREATE TABLE IF NOT EXISTS ${tableName} (                        
-                id SERIAL PRIMARY KEY,
-                block_number BIGINT NOT NULL,
-                transaction_hash VARCHAR(66) UNIQUE NOT NULL,
-                transaction_index INTEGER,
-                from_address VARCHAR(42) NOT NULL,
-                to_address VARCHAR(42),         
-                contract_address VARCHAR(42),
-                gas_used BIGINT,
-                cumulative_gas_used BIGINT,
-                gas_price BIGINT,
-                logs JSONB,
-                timestamp TIMESTAMP
-            )`;
+    const tableName = `${symbol.toLowerCase()}_transactions`;
 
-        await query(createTransactionTable);
-        console.log(`Table '${tableName}' verified`);
+    const sql = `
+        CREATE TABLE IF NOT EXISTS ${tableName} (
+            id SERIAL PRIMARY KEY,
+            block_number BIGINT NOT NULL,
+            transaction_hash VARCHAR(66) UNIQUE NOT NULL,
+            transaction_index INTEGER,
+            from_address VARCHAR(42) NOT NULL,
+            to_address VARCHAR(42),
+            contract_address VARCHAR(42),
+            gas_used BIGINT,
+            cumulative_gas_used BIGINT,
+            gas_price BIGINT,
+            logs JSONB,
+            timestamp TIMESTAMP
+        )
+    `;
 
-        return tableName;
-    } catch (error) {
-        console.log('Error setting up token table:', error);
-        throw error;
-    }
+    await query(sql);
+    console.log(`Table '${tableName}' verified`);
+    return tableName;
 }
 
-// Store transaction receipt
-async function storeTxReceipt(txHash, contractAddress, tableName, timestamp) {
+/* =========================
+   存交易（只存真正相关的）
+========================= */
+async function storeTxReceipt(txHash, contractAddress, tableName) {
     try {
         const receipt = await get_tx_receipt(txHash);
+        if (!receipt || !receipt.logs) return false;
 
-        // Prepare data for insertion
+        const target = contractAddress.toLowerCase();
+
+        // 二次校验（理论上 logs 扫描已经保证相关）
+        const related = receipt.logs.some(
+            log => log.address && log.address.toLowerCase() === target
+        );
+        if (!related) return false;
+
+        const block = await provider.getBlock(receipt.blockNumber);
+
         const txData = {
             block_number: Number(receipt.blockNumber),
-            transaction_hash: receipt.hash.toString(),
+            transaction_hash: receipt.hash,
             transaction_index: Number(receipt.index),
-            from_address: receipt.from.toString(),
-            to_address: receipt.to.toString(),
+            from_address: receipt.from,
+            to_address: receipt.to,
             contract_address: contractAddress,
             gas_used: Number(receipt.gasUsed),
             cumulative_gas_used: Number(receipt.cumulativeGasUsed),
-            gas_price: Number(receipt.gasPrice),
+            gas_price: receipt.effectiveGasPrice
+                ? Number(receipt.effectiveGasPrice)
+                : null,
             logs: JSON.stringify(receipt.logs),
-            timestamp: new Date(Number(timestamp) * 1000) // Convert Unix timestamp to JavaScript Date
+            timestamp: new Date(block.timestamp * 1000)
         };
 
-        // Insert into PostgreSQL
         await insert(tableName, txData);
-        console.log(`Stored transaction ${txHash} in block ${receipt.blockNumber}`);
-    } catch (error) {
-        console.error(`Error processing transaction ${txHash}:`, error);
-        throw error;
+        return true;
+    } catch (e) {
+        // duplicate tx_hash
+        if (e.code === '23505') return false;
+        throw e;
     }
 }
 
-// Scan blocks
-async function scanBlocks(contractAddress, startBlock, endBlock = 'latest', tableName) {
-    try {
-        const currentBlock = await provider.getBlockNumber();
-        const targetEndBlock = endBlock === 'latest' ? currentBlock : endBlock;
+/* =========================
+   基于 eth_getLogs 的高速扫描
+========================= */
+async function scanByLogs(contractAddress, startBlock, endBlock = 'latest', tableName) {
+    const currentBlock = await provider.getBlockNumber();
+    const targetEnd = endBlock === 'latest' ? currentBlock : endBlock;
 
-        let transactionsCount = 0;
-        for (let blockNumber = startBlock; blockNumber <= targetEndBlock; blockNumber++) {
-            try {
-                const block = await get_block_info(blockNumber);
-                if (block && block.transactions) {
-                    const txInfos = await Promise.all(
-                        block.transactions.map(tx => get_tx_info(tx))
-                    );
+    const BATCH_SIZE = 5000;
+    let count = 0;
 
-                    for (let i = 0; i < block.transactions.length; i++) {
-                        const tx = block.transactions[i];
-                        const txInfo = txInfos[i];
-                        const txFrom = txInfo.from;
-                        const txTo = txInfo.to;
+    for (let from = startBlock; from <= targetEnd; from += BATCH_SIZE) {
+        const to = Math.min(from + BATCH_SIZE - 1, targetEnd);
 
-                        if (
-                            (txFrom && txFrom.toLowerCase() === contractAddress.toLowerCase()) ||
-                            (txTo && txTo.toLowerCase() === contractAddress.toLowerCase())
-                        ) {
-                            await storeTxReceipt(tx, contractAddress, tableName, block.timestamp);
-                            transactionsCount++;
-                        }
-                    }
-                }
-            } catch (blockError) {
-                console.warn(`Error processing block ${blockNumber}:`, blockError.message);
-                continue;
-            }
+        console.log(`Scanning logs: ${from} → ${to}`);
 
-            // Progress update every 100 blocks
-            if (blockNumber % 100 === 0) {
-                console.log(`Scanned up to block ${blockNumber}, found ${transactionsCount} transactions so far`);
-            }
+        let logs;
+        try {
+            logs = await provider.getLogs({
+                address: contractAddress,
+                fromBlock: from,
+                toBlock: to
+            });
+        } catch (e) {
+            console.error(`getLogs failed [${from}-${to}]`, e.message);
+            continue;
         }
-    } catch (error) {
-        console.error('Error scanning blocks:', error);
-        throw error;
+
+        if (logs.length === 0) continue;
+
+        // 一个 tx 可能有多个 log，去重
+        const txHashes = [...new Set(logs.map(l => l.transactionHash))];
+
+        for (const txHash of txHashes) {
+            const inserted = await storeTxReceipt(
+                txHash,
+                contractAddress,
+                tableName
+            );
+            if (inserted) count++;
+        }
     }
-    return transactionsCount;
+
+    return count;
 }
 
+/* =========================
+   主流程
+========================= */
 async function getTokenTransactions(contractAddress = CONTRACT_ADDRESS) {
-    if (contractAddress == null) {
-        console.error('Error: Contract address is required');
+    if (!contractAddress) {
+        console.error('Contract address required');
         process.exit(1);
     }
 
-    try {
-        // Setup token table                                                                             
-        const tableName = await setupTokenTable(contractAddress);
-        const { isEmpty, maxBlock } = await getMaxBlockNumber(tableName);
+    const tableName = await setupTokenTable(contractAddress);
+    const { isEmpty, maxBlock } = await getMaxBlockNumber(tableName);
 
-        let startBlock;
-        if (isEmpty) {
-            console.log('Table is empty, finding deployment block...');
-            startBlock = await find_deployment_block(contractAddress);
-        } else {
-            console.log(`Table ${tableName} not empty, Latest block: ${maxBlock}`);
-            startBlock = Number(maxBlock) + 1;
-        }
-
-        // Get current block number                                                                      
-        const currentBlock = await provider.getBlockNumber();
-        console.log(startBlock);
-        
-        // Only scan if startBlock is not beyond current block                                           
-        if (startBlock > currentBlock) {
-            console.log('No new blocks to scan');
-            return 0;
-        }
-
-        // Scan from startBlock to latest block                                                          
-        const transactionsCount = await scanBlocks(
-            contractAddress,
-            startBlock,
-            'latest',
-            tableName
-        );
-
-        console.log(`Scan finished, found ${transactionsCount} new transactions`);
-        return transactionsCount;
-
-    } catch (error) {
-        console.error('Error in getTokenTransactions:', error);
-        throw error;
+    let startBlock;
+    if (isEmpty) {
+        console.log('Table empty, finding deployment block...');
+        startBlock = await find_deployment_block(contractAddress);
+    } else {
+        startBlock = Number(maxBlock) + 1;
+        console.log(`Resume from block ${startBlock}`);
     }
+
+    const currentBlock = await provider.getBlockNumber();
+    if (startBlock > currentBlock) {
+        console.log('No new blocks');
+        return 0;
+    }
+
+    const count = await scanByLogs(
+        contractAddress,
+        startBlock,
+        'latest',
+        tableName
+    );
+
+    console.log(`Scan finished. Inserted ${count} new transactions`);
+    return count;
 }
 
-getTokenTransactions(CONTRACT_ADDRESS);
+/* ========================= */
+
+getTokenTransactions(CONTRACT_ADDRESS)
+    .then(() => process.exit(0))
+    .catch(err => {
+        console.error(err);
+        process.exit(1);
+    });
