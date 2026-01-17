@@ -1,29 +1,63 @@
+import pLimit from 'p-limit';
 import { provider } from './provider.js';
-import {
-    get_tx_receipt,
-    find_deployment_block
-} from './callBlockInfo.js';
+import { get_tx_receipt, find_deployment_block } from './callBlockInfo.js';
 import { getTokenName } from './getTokenName.js';
-import { query, insert, getMaxBlockNumber } from './postgresql.js';
+import { query, getMaxBlockNumber } from './postgresql.js';
 
-const CONTRACT_ADDRESS = process.argv[2] || null;
+const CONTRACT_ADDRESS = process.argv[2];
+const BATCH_SIZE = 5000;     // block batch
+const INSERT_BATCH = 300;   // db insert batch
+const RPC_CONCURRENCY = 10; // receipt concurrency
 
 /* =========================
-   建表
+   工具：批量 INSERT
 ========================= */
-async function setupTokenTable(contractAddress) {
+async function batchInsert(tableName, rows) {
+    if (rows.length === 0) return;
+
+    const cols = Object.keys(rows[0]);
+    const values = [];
+    const placeholders = [];
+
+    rows.forEach((row, i) => {
+        const offset = i * cols.length;
+        placeholders.push(
+            `(${cols.map((_, j) => `$${offset + j + 1}`).join(',')})`
+        );
+        values.push(...cols.map(c => row[c]));
+    });
+
+    const sql = `
+        INSERT INTO ${tableName} (${cols.join(',')})
+        VALUES ${placeholders.join(',')}
+        ON CONFLICT (transaction_hash) DO NOTHING
+    `;
+
+    await query(sql, values);
+}
+
+/* =========================
+   主逻辑
+========================= */
+async function run(contractAddress) {
+    if (!contractAddress) {
+        console.error('Contract address required');
+        process.exit(1);
+    }
+
+    /* -------- token info -------- */
     const { name, symbol } = await getTokenName(contractAddress);
     console.log(`Token: ${name} (${symbol})`);
 
     const tableName = `${symbol.toLowerCase()}_transactions`;
 
-    const sql = `
+    await query(`
         CREATE TABLE IF NOT EXISTS ${tableName} (
             id SERIAL PRIMARY KEY,
-            block_number BIGINT NOT NULL,
-            transaction_hash VARCHAR(66) UNIQUE NOT NULL,
+            block_number BIGINT,
+            transaction_hash VARCHAR(66) UNIQUE,
             transaction_index INTEGER,
-            from_address VARCHAR(42) NOT NULL,
+            from_address VARCHAR(42),
             to_address VARCHAR(42),
             contract_address VARCHAR(42),
             gas_used BIGINT,
@@ -32,32 +66,44 @@ async function setupTokenTable(contractAddress) {
             logs JSONB,
             timestamp TIMESTAMP
         )
-    `;
+    `);
 
-    await query(sql);
-    console.log(`Table '${tableName}' verified`);
-    return tableName;
-}
+    /* -------- resume logic -------- */
+    const { isEmpty, maxBlock } = await getMaxBlockNumber(tableName);
+    let startBlock = isEmpty
+        ? await find_deployment_block(contractAddress)
+        : Number(maxBlock) + 1;
 
-/* =========================
-   存交易（只存真正相关的）
-========================= */
-async function storeTxReceipt(txHash, contractAddress, tableName) {
-    try {
+    const latest = await provider.getBlockNumber();
+    console.log(`Scanning ${startBlock} → ${latest}`);
+
+    /* -------- caches -------- */
+    const blockCache = new Map();
+    const limit = pLimit(RPC_CONCURRENCY);
+
+    async function getBlockCached(blockNumber) {
+        if (!blockCache.has(blockNumber)) {
+            blockCache.set(
+                blockNumber,
+                await provider.getBlock(blockNumber)
+            );
+        }
+        return blockCache.get(blockNumber);
+    }
+
+    async function buildTxData(txHash) {
         const receipt = await get_tx_receipt(txHash);
-        if (!receipt || !receipt.logs) return false;
+        if (!receipt || !receipt.logs) return null;
 
         const target = contractAddress.toLowerCase();
-
-        // 二次校验（理论上 logs 扫描已经保证相关）
         const related = receipt.logs.some(
-            log => log.address && log.address.toLowerCase() === target
+            l => l.address && l.address.toLowerCase() === target
         );
-        if (!related) return false;
+        if (!related) return null;
 
-        const block = await provider.getBlock(receipt.blockNumber);
+        const block = await getBlockCached(receipt.blockNumber);
 
-        const txData = {
+        return {
             block_number: Number(receipt.blockNumber),
             transaction_hash: receipt.hash,
             transaction_index: Number(receipt.index),
@@ -72,30 +118,12 @@ async function storeTxReceipt(txHash, contractAddress, tableName) {
             logs: JSON.stringify(receipt.logs),
             timestamp: new Date(block.timestamp * 1000)
         };
-
-        await insert(tableName, txData);
-        return true;
-    } catch (e) {
-        // duplicate tx_hash
-        if (e.code === '23505') return false;
-        throw e;
     }
-}
 
-/* =========================
-   基于 eth_getLogs 的高速扫描
-========================= */
-async function scanByLogs(contractAddress, startBlock, endBlock = 'latest', tableName) {
-    const currentBlock = await provider.getBlockNumber();
-    const targetEnd = endBlock === 'latest' ? currentBlock : endBlock;
-
-    const BATCH_SIZE = 5000;
-    let count = 0;
-
-    for (let from = startBlock; from <= targetEnd; from += BATCH_SIZE) {
-        const to = Math.min(from + BATCH_SIZE - 1, targetEnd);
-
-        console.log(`Scanning logs: ${from} → ${to}`);
+    /* -------- scan -------- */
+    for (let from = startBlock; from <= latest; from += BATCH_SIZE) {
+        const to = Math.min(from + BATCH_SIZE - 1, latest);
+        console.log(`Blocks ${from} → ${to}`);
 
         let logs;
         try {
@@ -105,69 +133,35 @@ async function scanByLogs(contractAddress, startBlock, endBlock = 'latest', tabl
                 toBlock: to
             });
         } catch (e) {
-            console.error(`getLogs failed [${from}-${to}]`, e.message);
+            console.error('getLogs failed:', e.message);
             continue;
         }
 
         if (logs.length === 0) continue;
 
-        // 一个 tx 可能有多个 log，去重
         const txHashes = [...new Set(logs.map(l => l.transactionHash))];
 
-        for (const txHash of txHashes) {
-            const inserted = await storeTxReceipt(
-                txHash,
-                contractAddress,
-                tableName
-            );
-            if (inserted) count++;
+        const tasks = txHashes.map(h =>
+            limit(() => buildTxData(h))
+        );
+
+        const results = await Promise.all(tasks);
+        const rows = results.filter(Boolean);
+
+        for (let i = 0; i < rows.length; i += INSERT_BATCH) {
+            const chunk = rows.slice(i, i + INSERT_BATCH);
+            await batchInsert(tableName, chunk);
         }
+
+        console.log(`Inserted ${rows.length} txs`);
     }
 
-    return count;
-}
-
-/* =========================
-   主流程
-========================= */
-async function getTokenTransactions(contractAddress = CONTRACT_ADDRESS) {
-    if (!contractAddress) {
-        console.error('Contract address required');
-        process.exit(1);
-    }
-
-    const tableName = await setupTokenTable(contractAddress);
-    const { isEmpty, maxBlock } = await getMaxBlockNumber(tableName);
-
-    let startBlock;
-    if (isEmpty) {
-        console.log('Table empty, finding deployment block...');
-        startBlock = await find_deployment_block(contractAddress);
-    } else {
-        startBlock = Number(maxBlock) + 1;
-        console.log(`Resume from block ${startBlock}`);
-    }
-
-    const currentBlock = await provider.getBlockNumber();
-    if (startBlock > currentBlock) {
-        console.log('No new blocks');
-        return 0;
-    }
-
-    const count = await scanByLogs(
-        contractAddress,
-        startBlock,
-        'latest',
-        tableName
-    );
-
-    console.log(`Scan finished. Inserted ${count} new transactions`);
-    return count;
+    console.log('Scan finished');
 }
 
 /* ========================= */
 
-getTokenTransactions(CONTRACT_ADDRESS)
+run(CONTRACT_ADDRESS)
     .then(() => process.exit(0))
     .catch(err => {
         console.error(err);
