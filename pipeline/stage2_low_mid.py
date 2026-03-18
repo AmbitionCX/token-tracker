@@ -1,6 +1,6 @@
 # pipeline/stage2_mid_filter.py
 
-from gates.low_gate import low_gate
+from gates.low_mid_gate import low_gate
 
 
 def run_stage2(dataset, tau_H=0.9):

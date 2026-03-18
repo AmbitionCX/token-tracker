@@ -1,3 +1,4 @@
+# pipeline/stage1_low.py
 from data.load_tx import stream_transactions
 from features.atom_extractor import extract_atomic_actions
 

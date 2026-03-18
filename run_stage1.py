@@ -1,5 +1,5 @@
-from pipeline.stage1_low_filter import build_step1_dataset
-from gates.low_gate import low_gate
+from pipeline.stage1_low import build_step1_dataset
+from gates.low_mid_gate import low_gate
 def main():
     print("Starting Stage 1: Building dataset with atomic actions...")
     start_block = 10000000
