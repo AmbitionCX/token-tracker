@@ -1,4 +1,4 @@
-//用法示例：node utils/blockTracePipeline.js 10000000 10001000
+//用法示例：node utils/blockTrace.js 10000000 10001000
 import fs from 'fs';
 import pLimit from 'p-limit';
 import { provider } from './provider.js';

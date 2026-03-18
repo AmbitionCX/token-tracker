@@ -1,11 +1,76 @@
-import { provider } from './provider.js';
-import { getTokenName } from './getTokenName.js';
-import { query, insert } from './postgresql.js';
+import pLimit from "p-limit";
+import { provider } from "./provider.js";
+import { getTokenName } from "./getTokenName.js";
+import { query } from "./postgresql.js";
 
 const CONTRACT_ADDRESS = process.argv[2] || null;
 
-async function get_tx_trace(txHash) {
+/* ---------- 参数 ---------- */
+
+const TX_BATCH = 400;
+const TRACE_CONCURRENCY = 12;
+const INSERT_BATCH = 200;
+
+/* ---------- profiling ---------- */
+
+const stats = {
+    txFetched: 0,
+    tracesDone: 0,
+    dbFetchTime: 0,
+    traceTime: 0,
+    dbInsertTime: 0
+};
+
+function printStats() {
+
+    console.log("\n------------ PROFILING ------------");
+
+    console.log("tx fetched:", stats.txFetched);
+    console.log("traces done:", stats.tracesDone);
+
+    console.log(
+        "avg DB fetch:",
+        stats.txFetched ? (stats.dbFetchTime / stats.txFetched).toFixed(2) : 0,
+        "ms"
+    );
+
+    console.log(
+        "avg trace RPC:",
+        stats.tracesDone ? (stats.traceTime / stats.tracesDone).toFixed(2) : 0,
+        "ms"
+    );
+
+    console.log(
+        "avg DB insert:",
+        stats.tracesDone ? (stats.dbInsertTime / stats.tracesDone).toFixed(2) : 0,
+        "ms"
+    );
+
+    const throughput = (stats.tracesDone / 10).toFixed(2);
+
+    console.log("throughput:", throughput, "tx/s");
+
+    console.log("-----------------------------------\n");
+
+    /* reset every 10s */
+
+    stats.txFetched = 0;
+    stats.tracesDone = 0;
+    stats.dbFetchTime = 0;
+    stats.traceTime = 0;
+    stats.dbInsertTime = 0;
+}
+
+setInterval(printStats, 10000);
+
+/* ---------- trace RPC ---------- */
+
+async function getTxTrace(txHash) {
+
+    const t0 = Date.now();
+
     try {
+
         const trace = await provider.send("debug_traceTransaction", [
             txHash,
             {
@@ -13,144 +78,193 @@ async function get_tx_trace(txHash) {
                 reexec: 14000000
             }
         ]);
+
+        const dt = Date.now() - t0;
+
+        stats.traceTime += dt;
+        stats.tracesDone++;
+
         return trace;
+
     } catch (err) {
-        console.error(`Error getting trace for ${txHash}:`, err);
-        throw err;
+
+        console.error(`Trace failed: ${txHash}`, err.message);
+        return null;
     }
 }
 
-async function setupTraceTable(tokenSymbol) {
-    const tableName = `${tokenSymbol.toLowerCase()}_traces`;
-    const createTraceTable = `
-        CREATE TABLE IF NOT EXISTS ${tableName} (
+/* ---------- DB setup ---------- */
+
+async function setupTraceTable(symbol) {
+
+    const table = `${symbol.toLowerCase()}_traces`;
+
+    const sql = `
+        CREATE TABLE IF NOT EXISTS ${table} (
             id SERIAL PRIMARY KEY,
-            transaction_hash VARCHAR(66) UNIQUE NOT NULL,
+            transaction_hash VARCHAR(66) UNIQUE,
             trace JSONB
         )
     `;
-    await query(createTraceTable);
-    console.log(`Table '${tableName}' for traces verified`);
-    return tableName;
+
+    await query(sql);
+
+    return table;
 }
 
-async function getLastTracedTxId(traceTable) {
-    try {
-        const queryText = `
-            SELECT MAX(id) as last_id
-            FROM ${traceTable}
-        `;               
-        const result = await query(queryText);
-        return result.rows[0].last_id || 0;
-    } catch (error) {
-        console.error('Error getting last traced tx ID:', error);
-        return 0;
-    }   
-} 
+/* ---------- last processed id ---------- */
 
-async function getNextTransaction(tokenSymbol, lastProcessedId) {
-    const transactionsTable = `${tokenSymbol.toLowerCase()}_transactions`;
+async function getLastProcessedId(traceTable) {
 
-    const getNextTxQuery = `
+    const res = await query(`
+        SELECT MAX(id) as last_id
+        FROM ${traceTable}
+    `);
+
+    return res.rows[0].last_id || 0;
+}
+
+/* ---------- get tx batch ---------- */
+
+async function getNextTransactions(symbol, lastId) {
+
+    const t0 = Date.now();
+
+    const table = `${symbol.toLowerCase()}_transactions`;
+
+    const sql = `
         SELECT id, transaction_hash
-        FROM ${transactionsTable}
+        FROM ${table}
         WHERE id > $1
         ORDER BY id ASC
-        LIMIT 1
+        LIMIT $2
     `;
 
-    const result = await query(getNextTxQuery, [lastProcessedId]);
+    const res = await query(sql, [lastId, TX_BATCH]);
 
-    if (result.rows.length === 0) {
-        return null;
-    }
+    const dt = Date.now() - t0;
 
-    return {
-        id: result.rows[0].id,
-        transaction_hash: result.rows[0].transaction_hash
-    };
+    stats.dbFetchTime += dt;
+    stats.txFetched += res.rows.length;
+
+    return res.rows;
 }
 
-async function storeTxTrace(txHash, traceTable) {
-    try {
-        const trace = await get_tx_trace(txHash);
+/* ---------- batch insert ---------- */
 
-        const traceData = {
-            transaction_hash: txHash,
-            trace: JSON.stringify(trace)
-        };
+async function batchInsert(table, rows) {
 
-        await insert(traceTable, traceData);
-        console.log(`Stored trace for ${txHash}`);
-    } catch (error) {
-        console.error(`Error storing trace for ${txHash}:`, error);
-        throw error;
-    }
+    if (rows.length === 0) return;
+
+    const t0 = Date.now();
+
+    const values = [];
+    const placeholders = [];
+
+    rows.forEach((r, i) => {
+
+        const idx = i * 2;
+
+        placeholders.push(`($${idx + 1}, $${idx + 2})`);
+
+        values.push(
+            r.transaction_hash,
+            JSON.stringify(r.trace)
+        );
+    });
+
+    const sql = `
+        INSERT INTO ${table} (transaction_hash, trace)
+        VALUES ${placeholders.join(",")}
+        ON CONFLICT (transaction_hash) DO NOTHING
+    `;
+
+    await query(sql, values);
+
+    const dt = Date.now() - t0;
+
+    stats.dbInsertTime += dt;
 }
 
-async function fetchTraces(contractAddress, traceTable) {     
-    try {                
-        const { symbol: tokenSymbol } = await getTokenName(contractAddress);
-        
-        // Get the last processed transaction ID from trace table           
-        const lastProcessedId = await getLastTracedTxId(traceTable);             
-        console.log(`Latest traced transaction: ${lastProcessedId}`);               
-        
-        let processedCount = 0;           
-        let currentId = lastProcessedId;  
-        
-        while (true) {   
-            // Get next transaction to process             
-            const nextTransaction = await getNextTransaction(tokenSymbol, currentId);                
-        
-            if (!nextTransaction) {       
-                console.log('No more transactions to process.');            
-                break;   
-            }            
-        
-            const { id: transactionId, transaction_hash: txHash } = nextTransaction;
-            console.log(`Processing ID: ${transactionId}, Hash: ${txHash}`);         
-        
-            try {        
-                // Fetch and store trace  
-                await storeTxTrace(txHash, traceTable);      
-                currentId = transactionId;
-                processedCount++;         
-        
-                // Add a small delay to avoid rate limiting
-                await new Promise(resolve => setTimeout(resolve, 200));     
-        
-            } catch (error) {             
-                console.error(`Failed to process transaction ID ${transactionId} (${txHash}):`, error.message);   
-                // Optional: retry logic              
-                currentId = transactionId;
-                continue;
-            } 
-        }                
-        return processedCount;            
-        
-    } catch (error) {    
-        console.error('Error processing traces sequentially:', error);      
-        throw error;     
-    }   
-}
+/* ---------- main pipeline ---------- */
 
-// Main function
-async function getTokenTraces(contractAddress = CONTRACT_ADDRESS) {
-    try {
-        const { name: tokenName, symbol: tokenSymbol } = await getTokenName(contractAddress);
-        const traceTable = await setupTraceTable(tokenSymbol);
+async function fetchTraces(contractAddress) {
 
-        const tracesCount = await fetchTraces(
-            contractAddress,
-            traceTable
+    const { symbol } = await getTokenName(contractAddress);
+
+    const traceTable = await setupTraceTable(symbol);
+
+    let currentId = await getLastProcessedId(traceTable);
+
+    console.log(`Start tracing from id ${currentId}`);
+
+    const limit = pLimit(TRACE_CONCURRENCY);
+
+    let total = 0;
+
+    while (true) {
+
+        const txs = await getNextTransactions(symbol, currentId);
+
+        if (txs.length === 0) {
+            console.log("No more transactions.");
+            break;
+        }
+
+        console.log(`Processing ${txs.length} transactions`);
+
+        /* ---- parallel trace ---- */
+
+        const tasks = txs.map(tx =>
+            limit(async () => {
+
+                const trace = await getTxTrace(tx.transaction_hash);
+
+                if (!trace) return null;
+
+                return {
+                    transaction_hash: tx.transaction_hash,
+                    trace
+                };
+            })
         );
 
-        console.log(`Trace scan finished, ${tracesCount} traces stored`);
-    } catch (error) {
-        console.error('Error in getTokenTraces:', error);
-        throw error;
+        const results = await Promise.all(tasks);
+
+        const valid = results.filter(Boolean);
+
+        /* ---- batch insert ---- */
+
+        for (let i = 0; i < valid.length; i += INSERT_BATCH) {
+
+            const chunk = valid.slice(i, i + INSERT_BATCH);
+
+            await batchInsert(traceTable, chunk);
+        }
+
+        currentId = txs[txs.length - 1].id;
+
+        total += valid.length;
+
+        console.log(`Stored ${valid.length} traces | total ${total}`);
     }
+
+    console.log(`Trace scan finished: ${total}`);
 }
 
-getTokenTraces(CONTRACT_ADDRESS);
+/* ---------- main ---------- */
+
+async function main() {
+
+    if (!CONTRACT_ADDRESS) {
+        console.error("Contract address required");
+        process.exit(1);
+    }
+
+    await fetchTraces(CONTRACT_ADDRESS);
+}
+
+main().catch(err => {
+    console.error(err);
+    process.exit(1);
+});
