@@ -13,17 +13,17 @@ A comprehensive Graph Neural Network system for detecting suspicious transaction
 ```
 Raw Transaction
      ↓
-[External Features] ← 7 dimensions
+[External Features] ← 4 dimensions
      ↓
-[Internal Call Trace] → Linearize (DFS) → Tokenize → Encode (Transformer/LSTM/Pooling) ← 128 dimensions
+[Internal Call Trace] → Linearize (DFS) → Tokenize → Encode (Transformer/LSTM/Pooling)
      ↓
-[Combined Edge Features] = 135 dimensions
+[Combined Edge Features] 
      ↓
 [GNN Module] → Node Representations
      ↓
 [Edge Attention Aggregation] → Incorporate neighborhood context
      ↓
-[Classifier] → Binary Classification (Suspicious/Normal)
+[Classifier] → Binary Classification (Suspicious/Normal)  /Multi Classification
 ```
 
 ## Project Structure
@@ -46,16 +46,19 @@ models/main/
 │   ├── seq_gnn_model.py              # Main SequenceGNN model + ablations
 │   └── __init__.py
 │
-├── baselines/                         # Baseline models
-│   ├── __init__.py                   # Traditional ML & simple baselines
-│   ├── traditional_models.py         # LogReg, RF, XGBoost
-│   ├── graph_models.py               # Graph-only baselines
-│   └── sequence_models.py            # Sequence-only baselines
+├── baselines/
+│   ├── __init__.py
+│   ├── xgboost_model.py              # XGBoost (External only)
+│   ├── mlp_model.py                  # MLP (+ Mean Trace)
+│   ├── lstm_model.py                 # LSTM (Trace only)
+│   ├── transformer_model.py          # Transformer (Trace only)
+│   ├── gnn_model.py                  # GNN (External only)
+│   ├── gnn_mean_trace_model.py       # GNN + Mean Trace
+│   ├── gnn_transformer_model.py      # GNN + Transformer
 │
 ├── data/                              # Data loading & preprocessing
 │   ├── data_loader.py                # PostgreSQL streaming + caching
 │   ├── graph_constructor.py          # Build temporal graphs from batches
-│   ├── feature_pipeline.py           # Feature extraction pipeline
 │   └── __init__.py
 │
 ├── training/                          # Training framework
@@ -120,6 +123,15 @@ models/main/
   - `NoAttentionSequenceGNN`: No attention aggregation
   - `LSTMSequenceGNN`: LSTM instead of Transformer
   - `PoolingSequenceGNN`: Pooling instead of Transformer
+
+#### Baseline Models (aligned with Table 1)
+- `xgboost_model.py`: XGBoost using external transaction features only
+- `mlp_model.py`: MLP with external + mean-pooled trace features
+- `lstm_model.py`: LSTM encoder over call trace sequences
+- `transformer_model.py`: Transformer encoder over call trace sequences
+- `gnn_model.py`: GNN using external features only
+- `gnn_mean_trace_model.py`: GNN with mean-pooled trace features
+- `gnn_transformer_model.py`: GNN with Transformer-based trace encoding
 
 ### 3. Data Processing (Phase 4)
 
