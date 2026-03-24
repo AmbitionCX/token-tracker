@@ -42,7 +42,7 @@ features:
     embedding_dim: 128
     
   # Dimensions
-  external_dim: 6       # TemporalGraphWithTraces produces 6-dim external features
+  external_dim: 4       # External features: value, gas_used, calldata_len, is_revert
   trace_dim: 128
   total_edge_dim: 134   # 6 external + 128 trace
 

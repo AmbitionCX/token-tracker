@@ -42,7 +42,7 @@ class SequenceGNNModel(nn.Module):
     def __init__(
         self,
         # External feature config
-        external_dim: int = 6,
+        external_dim: int = 4,
         use_external: bool = True,   # False → "Trace only" models
         
         # Trace encoding config
@@ -163,14 +163,17 @@ class SequenceGNNModel(nn.Module):
     def forward(
         self,
         # External features
-        external_features: torch.Tensor,        # (batch_size, 7)
+        external_features: torch.Tensor,        # (batch_size, 4)
         
         # Internal trace tokenized data
         call_type_ids: torch.Tensor,            # (batch_size, seq_len)
         contract_ids: torch.Tensor,             # (batch_size, seq_len)
         func_selector_ids: torch.Tensor,        # (batch_size, seq_len)
         depths: torch.Tensor,                   # (batch_size, seq_len)
-        exec_properties: torch.Tensor,          # (batch_size, seq_len, 4)
+        status_ids: torch.Tensor,               # (batch_size, seq_len) 0/1
+        input_sizes: torch.Tensor,              # (batch_size, seq_len) log(1+len)
+        output_sizes: torch.Tensor,             # (batch_size, seq_len)
+        gas_vals: torch.Tensor,                # (batch_size, seq_len)
         trace_mask: Optional[torch.Tensor] = None,  # (batch_size, seq_len)
         
         # Graph structure
@@ -209,7 +212,14 @@ class SequenceGNNModel(nn.Module):
         if self.use_trace:
             # Get call event embeddings from trace encoder
             trace_emb = self.edge_feature_extractor.call_event_embedding(
-                call_type_ids, contract_ids, func_selector_ids, depths, exec_properties
+                call_type_ids,
+                contract_ids,
+                func_selector_ids,
+                depths,
+                status_ids,
+                input_sizes,
+                output_sizes,
+                gas_vals,
             )  # (batch_size, seq_len, call_event_embedding.output_dim)
             # TraceEncoder's internal input_proj handles the projection to hidden_dim
             

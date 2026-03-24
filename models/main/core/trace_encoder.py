@@ -116,9 +116,14 @@ class TransformerTraceEncoder(nn.Module):
             attn_mask = ~mask.unsqueeze(1).unsqueeze(1)  # (batch_size, 1, 1, seq_len)
         
         # Apply transformer
-        transformed = self.transformer(x, src_key_padding_mask=~mask if mask is not None else None)
+        padding_mask = ~mask if mask is not None else None
+        transformed = self.transformer(x, src_key_padding_mask=padding_mask)
         # (batch_size, seq_len, hidden_dim)
-        
+        # When a row has no valid tokens, padding_mask is all-True and PyTorch's
+        # TransformerEncoder returns NaNs for that row — sanitize before pooling.
+        if mask is not None:
+            transformed = torch.nan_to_num(transformed, nan=0.0, posinf=0.0, neginf=0.0)
+
         # Aggregate: use CLS-like mechanism (mean pooling over valid tokens)
         if mask is not None:
             # Mask-aware pooling
@@ -185,21 +190,26 @@ class LSTMTraceEncoder(nn.Module):
         """
         # Project input
         x = self.input_proj(x)  # (batch_size, seq_len, hidden_dim)
-        
-        # Pack sequence for LSTM
+        batch_size = x.size(0)
+        hidden_dim = x.size(2)
+
+        # Pack sequence for LSTM (length 0 is invalid for pack_padded_sequence)
         if mask is not None:
-            seq_lengths = mask.sum(dim=1).cpu()
-            x_packed = nn.utils.rnn.pack_padded_sequence(
-                x, seq_lengths, batch_first=True, enforce_sorted=False
-            )
-            lstm_out, (h_n, c_n) = self.lstm(x_packed)
-            lstm_out, _ = nn.utils.rnn.pad_packed_sequence(lstm_out, batch_first=True)
+            seq_lengths = mask.sum(dim=1).long()
+            output = torch.zeros(batch_size, hidden_dim, device=x.device, dtype=x.dtype)
+            valid = seq_lengths > 0
+            if valid.any():
+                x_v = x[valid]
+                lens_v = seq_lengths[valid].cpu()
+                x_packed = nn.utils.rnn.pack_padded_sequence(
+                    x_v, lens_v, batch_first=True, enforce_sorted=False
+                )
+                _, (h_n, c_n) = self.lstm(x_packed)
+                output[valid] = h_n[-1]
+            # rows with empty trace stay zeros
         else:
-            lstm_out, (h_n, c_n) = self.lstm(x)
-        
-        # Use last hidden state
-        # h_n: (num_layers, batch_size, hidden_dim)
-        output = h_n[-1]  # (batch_size, hidden_dim)
+            _, (h_n, c_n) = self.lstm(x)
+            output = h_n[-1]  # (batch_size, hidden_dim)
         
         # Final projection
         output = self.output_proj(output)  # (batch_size, hidden_dim)
@@ -261,8 +271,13 @@ class PoolingTraceEncoder(nn.Module):
             if self.pool_type == "mean":
                 output = masked_x.sum(dim=1) / (mask.sum(dim=1, keepdim=True) + 1e-9)
             elif self.pool_type == "max":
+                masked_x = x.clone()
                 masked_x[~mask_expanded] = float('-inf')
                 output = torch.max(masked_x, dim=1)[0]
+                # All-padding rows: max is -inf → would break downstream layers
+                empty_rows = mask.sum(dim=1) == 0
+                if empty_rows.any():
+                    output[empty_rows] = 0
             else:
                 raise ValueError(f"Unknown pool_type: {self.pool_type}")
         else:
@@ -354,74 +369,80 @@ class TraceEncoder(nn.Module):
 class CallEventEmbedding(nn.Module):
     """
     Convert raw call trace information into dense embeddings.
-    
-    Embeds multiple semantic dimensions of a call event:
-    - Call type (CALL, DELEGATECALL, STATICCALL, CREATE)
-    - Called contract address
-    - Function selector (4-byte)
-    - Call depth
-    - Execution properties (revert status, gas used, I/O size)
+
+    Eight semantic dimensions per call event:
+    - Call type          (discrete → Embedding)
+    - Callee address     (hash % N → Embedding)
+    - Function selector  (hash % N → Embedding)
+    - Call depth         (integer → Embedding)
+    - Execution status   (0: empty output / 1: has output → Embedding)
+    - Input size         (log-normalised scalar → Linear)
+    - Output size        (log-normalised scalar → Linear)
+    - Gas usage          (log-normalised scalar → Linear)
     """
-    
+
     def __init__(
         self,
-        call_type_vocab_size: int = 10,      # Types: CALL, DELEGATECALL, STATICCALL, CREATE2, etc.
-        contract_vocab_size: int = 50000,    # Number of unique contracts
-        func_selector_vocab_size: int = 100000,  # Number of unique functions
-        depth_max: int = 50,                  # Max call depth
-        embedding_dim: int = 32,              # Dimension per semantic component
+        call_type_vocab_size: int = 10,
+        contract_vocab_size: int = 50000,
+        func_selector_vocab_size: int = 100000,
+        depth_max: int = 50,
+        embedding_dim: int = 32,
         dropout: float = 0.1
     ):
         super().__init__()
-        
+
         self.embedding_dim = embedding_dim
-        
-        # Semantic dimension embeddings
+
+        # Discrete → Embedding
         self.call_type_emb = nn.Embedding(call_type_vocab_size, embedding_dim, padding_idx=0)
         self.contract_emb = nn.Embedding(contract_vocab_size, embedding_dim, padding_idx=0)
         self.func_selector_emb = nn.Embedding(func_selector_vocab_size, embedding_dim, padding_idx=0)
         self.depth_emb = nn.Embedding(depth_max, embedding_dim)
-        
-        # Execution properties: [revert_flag, log_input_size, log_output_size, log_gas_used]
-        self.exec_proj = nn.Sequential(
-            nn.Linear(4, embedding_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
+        self.status_emb = nn.Embedding(2, embedding_dim)   # 0 = empty output, 1 = has output
+
+        # Continuous scalar → Linear projection
+        self.input_size_proj = nn.Sequential(
+            nn.Linear(1, embedding_dim), nn.ReLU(), nn.Dropout(dropout)
         )
-        
-        # Combined output dimension: 5 embeddings × embedding_dim
-        self.output_dim = 5 * embedding_dim
-    
+        self.output_size_proj = nn.Sequential(
+            nn.Linear(1, embedding_dim), nn.ReLU(), nn.Dropout(dropout)
+        )
+        self.gas_proj = nn.Sequential(
+            nn.Linear(1, embedding_dim), nn.ReLU(), nn.Dropout(dropout)
+        )
+
+        # Combined output dimension: 8 semantic components × embedding_dim
+        self.output_dim = 8 * embedding_dim
+
     def forward(
         self,
-        call_type_ids: torch.Tensor,        # (batch_size, seq_len)
-        contract_ids: torch.Tensor,         # (batch_size, seq_len)
-        func_selector_ids: torch.Tensor,    # (batch_size, seq_len)
-        depths: torch.Tensor,               # (batch_size, seq_len)
-        exec_properties: torch.Tensor       # (batch_size, seq_len, 4)
+        call_type_ids: torch.Tensor,       # (batch, seq_len)
+        contract_ids: torch.Tensor,        # (batch, seq_len)
+        func_selector_ids: torch.Tensor,   # (batch, seq_len)
+        depths: torch.Tensor,              # (batch, seq_len)
+        status_ids: torch.Tensor,          # (batch, seq_len)  0 or 1
+        input_sizes: torch.Tensor,         # (batch, seq_len)  log-normalised
+        output_sizes: torch.Tensor,        # (batch, seq_len)  log-normalised
+        gas_vals: torch.Tensor             # (batch, seq_len)  log-normalised
     ) -> torch.Tensor:
         """
-        Args:
-            call_type_ids: Call type indices
-            contract_ids: Contract address indices
-            func_selector_ids: Function selector indices
-            depths: Call depth (0-49)
-            exec_properties: [revert_flag, log_input_size, log_output_size, log_gas_used]
-        
         Returns:
-            (batch_size, seq_len, 5*embedding_dim) - combined event embeddings
+            (batch, seq_len, 8 * embedding_dim) - combined event embeddings
         """
-        # Embed each semantic dimension
-        type_emb = self.call_type_emb(call_type_ids)  # (batch, seq, embed)
+        type_emb     = self.call_type_emb(call_type_ids)
         contract_emb = self.contract_emb(contract_ids)
-        func_emb = self.func_selector_emb(func_selector_ids)
-        depth_emb = self.depth_emb(depths.long())
-        
-        # Embed execution properties
-        exec_emb = self.exec_proj(exec_properties)  # (batch, seq, embed)
-        
-        # Concatenate all embeddings
-        combined = torch.cat([type_emb, contract_emb, func_emb, depth_emb, exec_emb], dim=-1)
-        # (batch_size, seq_len, 5*embedding_dim)
-        
+        func_emb     = self.func_selector_emb(func_selector_ids)
+        depth_emb    = self.depth_emb(depths.long())
+        status_emb   = self.status_emb(status_ids.long())
+
+        input_emb  = self.input_size_proj(input_sizes.unsqueeze(-1))
+        output_emb = self.output_size_proj(output_sizes.unsqueeze(-1))
+        gas_emb    = self.gas_proj(gas_vals.unsqueeze(-1))
+
+        combined = torch.cat(
+            [type_emb, contract_emb, func_emb, depth_emb,
+             status_emb, input_emb, output_emb, gas_emb],
+            dim=-1
+        )
         return combined

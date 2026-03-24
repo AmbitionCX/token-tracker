@@ -106,6 +106,7 @@ class TransactionDataLoader:
         if start_block is not None and end_block is not None:
             query += f" AND tj.block_number BETWEEN {start_block} AND {end_block}"
         
+        query += " ORDER BY tj.timestamp ASC"
         
         try:
             for chunk in pd.read_sql(query, conn, chunksize=chunk_size):
@@ -232,7 +233,10 @@ def stream_prepared_transactions(
                 'contract_ids': edge_features_dict['contract_ids'],
                 'func_selector_ids': edge_features_dict['func_selector_ids'],
                 'depths': edge_features_dict['depths'],
-                'exec_properties': edge_features_dict['exec_properties'],
+                'status_ids': edge_features_dict['status_ids'],
+                'input_sizes': edge_features_dict['input_sizes'],
+                'output_sizes': edge_features_dict['output_sizes'],
+                'gas_vals': edge_features_dict['gas_vals'],
                 'trace_mask': edge_features_dict['trace_mask']
             }
             

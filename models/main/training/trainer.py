@@ -443,7 +443,10 @@ class GNNWindowTrainer:
                 window['contract_ids'][s:e].to(self.device),
                 window['func_selector_ids'][s:e].to(self.device),
                 window['depths'][s:e].to(self.device),
-                window['exec_properties'][s:e].to(self.device),
+                window['status_ids'][s:e].to(self.device),
+                window['input_sizes'][s:e].to(self.device),
+                window['output_sizes'][s:e].to(self.device),
+                window['gas_vals'][s:e].to(self.device),
             )
             chunk_repr = self.model.trace_encoder(
                 chunk_emb,
@@ -460,8 +463,8 @@ class GNNWindowTrainer:
     ) -> torch.Tensor:
         """Concatenate external features (if enabled) and trace repr."""
         if self.model.use_external:
-            ext = window['external_features'].to(self.device)  # (E, 6)
-            return torch.cat([ext, trace_repr], dim=-1)         # (E, 134)
+            ext = window['external_features'].to(self.device)  # (E, 4)
+            return torch.cat([ext, trace_repr], dim=-1)         # (E, 4 + trace_hidden_dim)
         return trace_repr                                        # (E, 128)
 
     # ------------------------------------------------------------------

@@ -15,6 +15,7 @@ Handles:
 - Caching for efficiency
 """
 
+import math
 import torch
 import numpy as np
 import pandas as pd
@@ -26,10 +27,7 @@ from tqdm import tqdm
 import networkx as nx
 
 from .data_loader import TransactionDataLoader
-from core import (
-    EdgeFeatureExtractor,
-    CallEventEmbedding
-)
+from core import EdgeFeatureExtractor
 
 
 def linearize_call_trace(trace_data: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -69,6 +67,15 @@ def linearize_call_trace(trace_data: Dict[str, Any]) -> List[Dict[str, Any]]:
     
     return calls
 
+def _external_features_to_dim4(arr: Any) -> np.ndarray:
+    """Pad / truncate external feature vector to 4 dimensions (value, gas, calldata, revert)."""
+    raw = np.asarray(arr, dtype=np.float32).ravel()
+    out = np.zeros(4, dtype=np.float32)
+    n = min(4, len(raw))
+    out[:n] = raw[:n]
+    return out
+
+
 def _parse_value(val: Any) -> float:
     """Parse value which could be int, str, or hex string."""
     if val is None or val == 0:
@@ -88,72 +95,73 @@ def _parse_value(val: Any) -> float:
             return 0.0
     return 0.0
 
-def tokenize_call_events(call_events: List[Dict[str, Any]]) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+def tokenize_call_events(
+    call_events: List[Dict[str, Any]]
+) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray,
+          np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Tokenize call events according to §4.2.2.
-    
-    Each call event c_i encoded as: x_i = e_type + e_contract + e_func + e_depth + e_exec
-    
+    Tokenize call events (aligned with core/edge_feature_extractor InternalCallTraceFeatures).
+
     Returns:
-        Tuple of token ID arrays:
-        - call_type_ids: (seq_len,)
-        - contract_ids: extracted from 'to' address
-        - func_ids: extracted from input selector
-        - depth_ids: depth tokenized
-        - exec_properties: (seq_len, 4) - [revert, gas_ratio, input_len, output_len]
+        call_type_ids, contract_ids, func_ids, depth_ids,
+        status_ids (0 = output == "0x", else 1),
+        input_sizes, output_sizes, gas_vals — each log(1+x) for the three floats.
     """
     seq_len = len(call_events)
-    
-    # Initialize token arrays
+
     call_type_ids = np.zeros(seq_len, dtype=np.int64)
-    contract_ids = np.zeros(seq_len, dtype=np.int64)  
+    contract_ids = np.zeros(seq_len, dtype=np.int64)
     func_ids = np.zeros(seq_len, dtype=np.int64)
     depth_ids = np.zeros(seq_len, dtype=np.int64)
-    exec_properties = np.zeros((seq_len, 4), dtype=np.float32)
-    
-    # Call type mapping
+    status_ids = np.zeros(seq_len, dtype=np.int64)
+    input_sizes = np.zeros(seq_len, dtype=np.float32)
+    output_sizes = np.zeros(seq_len, dtype=np.float32)
+    gas_vals = np.zeros(seq_len, dtype=np.float32)
+
     call_type_map = {
         'CALL': 1,
         'DELEGATECALL': 2,
         'STATICCALL': 3,
         'CREATE': 4,
-        'CREATE2': 5
+        'CREATE2': 5,
+        'SELFDESTRUCT': 6,
     }
-    
+
     for i, event in enumerate(call_events):
-        # Token 1: Call type
         call_type_ids[i] = call_type_map.get(event['call_type'], 0)
-        
-        # Token 2: Contract address (hash to index)
-        to_addr = event['to'].lower()
-        contract_ids[i] = hash(to_addr) % 10000  # Fixed vocabulary size
-        
-        # Token 3: Function selector (first 4 bytes of input)
-        input_str = event['input']
-        if len(input_str) >= 10:  # 0x + 8 hex chars
+
+        to_addr = str(event.get('to', '0x0')).lower()
+        contract_ids[i] = hash(to_addr) % 50000
+
+        input_str = event.get('input', '0x') or '0x'
+        if len(input_str) >= 10:
             func_selector = int(input_str[2:10], 16)
         else:
             func_selector = 0
-        func_ids[i] = func_selector % 10000
-        
-        # Token 4: Call depth
-        depth_ids[i] = min(event['depth'], 15)  # Cap depth at 15
-        
-        # Token 5: Execution properties [revert_flag, gas_used_ratio, input_len, output_len]
-        input_len = (len(event['input']) - 2) // 2  # Bytes
-        output_len = (len(event['output']) - 2) // 2
-        gas_used = _parse_value(event.get('gas_used', 0))
-        gas = _parse_value(event.get('gas', 0))
-        gas_ratio = min(gas_used / max(gas, 1), 1.0)
-        
-        exec_properties[i] = [
-            float(event['revert']),
-            gas_ratio,
-            min(input_len / 1000.0, 1.0),  # Normalize to [0,1]
-            min(output_len / 1000.0, 1.0)
-        ]
-    
-    return call_type_ids, contract_ids, func_ids, depth_ids, exec_properties
+        func_ids[i] = func_selector % 100000
+
+        depth_ids[i] = min(int(event.get('depth', 0)), 49)
+
+        out = event.get('output', '0x') or '0x'
+        status_ids[i] = 0 if out == '0x' else 1
+
+        inp = event.get('input', '0x') or '0x'
+        input_len = (len(inp) - 2) // 2 if inp.startswith('0x') else 0
+        output_len = (len(out) - 2) // 2 if out.startswith('0x') else 0
+        input_sizes[i] = math.log(1 + input_len)
+        output_sizes[i] = math.log(1 + output_len)
+
+        gu = event.get('gas_used', 0)
+        if isinstance(gu, str) and gu.startswith('0x'):
+            gas_used = int(gu, 16)
+        else:
+            gas_used = int(_parse_value(gu))
+        gas_vals[i] = math.log(1 + gas_used)
+
+    return (
+        call_type_ids, contract_ids, func_ids, depth_ids,
+        status_ids, input_sizes, output_sizes, gas_vals
+    )
 
 
 class TemporalGraphWithTraces:
@@ -180,7 +188,7 @@ class TemporalGraphWithTraces:
         gas_used: int,
         trace_data: Dict[str, Any],
         is_suspicious: int,
-        external_feat_dim: int = 6
+        external_feat_dim: int = 4
     ) -> None:
         """
         Add a transaction as an edge to the temporal graph.
@@ -191,7 +199,7 @@ class TemporalGraphWithTraces:
             value, gas_used: Transaction properties
             trace_data: Complete call trace
             is_suspicious: Label
-            external_feat_dim: Dimension of external features
+            external_feat_dim: Dimension of external features (4: value, gas, calldata, revert)
         """
         # Add nodes to V_k
         self.nodes_set.add(from_addr)
@@ -206,28 +214,44 @@ class TemporalGraphWithTraces:
             'gas_used': gas_used
         })
         
-        # Extract external features (§4.1)
+        # External features (§4.1) — same normalisation as ExternalTransactionFeatures
+        def _norm_val(v: float, max_val: float = 1e18) -> float:
+            if v <= 0:
+                return 0.0
+            return math.log(v + 1e-9) / math.log(max_val + 1e-9)
+
+        calldata_length = 0
+        if isinstance(trace_data, dict) and 'input' in trace_data:
+            input_hex = trace_data['input']
+            if isinstance(input_hex, str) and input_hex.startswith('0x'):
+                calldata_length = (len(input_hex) - 2) // 2
+        is_revert = 0.0
+        if isinstance(trace_data, dict):
+            output = trace_data.get('output', '0x')
+            if output == '0x' and 'calls' not in trace_data:
+                is_revert = 1.0
+
         external_features = np.array([
-            float(value),
-            float(gas_used),
-            0.0,  # calldata_length - computed later if needed
-            1.0 if to_addr != '0x' * 40 else 0.0,  # is_contract_call
-            0.0,  # is_revert (from trace)
-            0.0   # nonce_position (from context)
-        ], dtype=np.float32) / np.array([1e18, 1e9, 1e6, 1.0, 1.0, 1.0])  # Normalization
-        
+            _norm_val(float(value)),
+            _norm_val(float(gas_used), max_val=10e6),
+            _norm_val(float(calldata_length), max_val=10000),
+            is_revert,
+        ], dtype=np.float32)
+
         # Process internal call trace (§4.2)
         call_events = linearize_call_trace(trace_data)
-        call_type_ids, contract_ids, func_ids, depth_ids, exec_properties = \
-            tokenize_call_events(call_events)
-        
-        # Create trace encoding inputs
+        (call_type_ids, contract_ids, func_ids, depth_ids,
+         status_ids, input_sizes, output_sizes, gas_vals) = tokenize_call_events(call_events)
+
         trace_features = {
             'call_type_ids': call_type_ids,
             'contract_ids': contract_ids,
             'func_ids': func_ids,
             'depth_ids': depth_ids,
-            'exec_properties': exec_properties,
+            'status_ids': status_ids,
+            'input_sizes': input_sizes,
+            'output_sizes': output_sizes,
+            'gas_vals': gas_vals,
             'sequence_length': len(call_events)
         }
         
@@ -686,8 +710,14 @@ class EdgeLevelDataset(torch.utils.data.Dataset):
         label = int(graph['edge_labels'][e_idx])
 
         max_seq_len = self.MAX_SEQ_LEN
-        ext_feat = np.asarray(edge_feat['external_features'], dtype=np.float32)
+        ext_feat = _external_features_to_dim4(edge_feat['external_features'])
         trace_feat = edge_feat['trace_features']
+        _required_trace_keys = ('status_ids', 'input_sizes', 'output_sizes', 'gas_vals')
+        if not all(k in trace_feat for k in _required_trace_keys):
+            raise ValueError(
+                "Graph cache format is outdated (missing per-call trace fields). "
+                "Rebuild graphs with construct_graphs(..., force_rebuild=True)."
+            )
         seq_len = trace_feat['sequence_length']
         max_len = min(seq_len, max_seq_len)
 
@@ -695,7 +725,10 @@ class EdgeLevelDataset(torch.utils.data.Dataset):
         contract  = np.zeros(max_seq_len, dtype=np.int64)
         func_id   = np.zeros(max_seq_len, dtype=np.int64)
         depth     = np.zeros(max_seq_len, dtype=np.int64)
-        exec_prop = np.zeros((max_seq_len, 4), dtype=np.float32)
+        status    = np.zeros(max_seq_len, dtype=np.int64)
+        input_sz  = np.zeros(max_seq_len, dtype=np.float32)
+        output_sz = np.zeros(max_seq_len, dtype=np.float32)
+        gas_v     = np.zeros(max_seq_len, dtype=np.float32)
         mask      = np.zeros(max_seq_len, dtype=bool)
 
         if max_len > 0:
@@ -703,7 +736,10 @@ class EdgeLevelDataset(torch.utils.data.Dataset):
             contract[:max_len]  = trace_feat['contract_ids'][:max_len]
             func_id[:max_len]   = trace_feat['func_ids'][:max_len]
             depth[:max_len]     = trace_feat['depth_ids'][:max_len]
-            exec_prop[:max_len] = trace_feat['exec_properties'][:max_len]
+            status[:max_len]    = trace_feat['status_ids'][:max_len]
+            input_sz[:max_len]  = trace_feat['input_sizes'][:max_len]
+            output_sz[:max_len] = trace_feat['output_sizes'][:max_len]
+            gas_v[:max_len]     = trace_feat['gas_vals'][:max_len]
             mask[:max_len]      = True
 
         return {
@@ -712,7 +748,10 @@ class EdgeLevelDataset(torch.utils.data.Dataset):
             'contract_ids':       torch.from_numpy(contract),
             'func_selector_ids':  torch.from_numpy(func_id),
             'depths':             torch.from_numpy(depth),
-            'exec_properties':    torch.from_numpy(exec_prop),
+            'status_ids':         torch.from_numpy(status),
+            'input_sizes':        torch.from_numpy(input_sz),
+            'output_sizes':       torch.from_numpy(output_sz),
+            'gas_vals':           torch.from_numpy(gas_v),
             'trace_mask':         torch.from_numpy(mask),
             'labels':             torch.tensor(label, dtype=torch.long),
             'num_edges':          torch.tensor(1, dtype=torch.long),
@@ -742,7 +781,10 @@ def collate_graph_batch(
     all_contract_ids = []
     all_func_selector_ids = []
     all_depths = []
-    all_exec_properties = []
+    all_status_ids = []
+    all_input_sizes = []
+    all_output_sizes = []
+    all_gas_vals = []
     all_trace_masks = []
     all_labels = []
     
@@ -759,13 +801,17 @@ def collate_graph_batch(
         
         # Process each edge
         for edge_feature_dict in graph['edge_features']:
-            # External features (§4.1)
-            ext_feat = edge_feature_dict['external_features']  # (7,)
+            ext_feat = _external_features_to_dim4(edge_feature_dict['external_features'])
             all_external_features.append(torch.from_numpy(ext_feat).float())
             
             # Internal trace features (§4.2)
             trace_feat = edge_feature_dict['trace_features']
-            
+            _req = ('status_ids', 'input_sizes', 'output_sizes', 'gas_vals')
+            if not all(k in trace_feat for k in _req):
+                raise ValueError(
+                    "Graph cache format is outdated. Rebuild with force_rebuild=True."
+                )
+
             # Tokenized trace sequences
             seq_len = trace_feat['sequence_length']
             max_len = min(seq_len, max_seq_len)
@@ -775,14 +821,19 @@ def collate_graph_batch(
             contract = torch.zeros(max_seq_len, dtype=torch.long)
             func_id = torch.zeros(max_seq_len, dtype=torch.long)
             depth = torch.zeros(max_seq_len, dtype=torch.long)
-            exec_prop = torch.zeros((max_seq_len, 4), dtype=torch.float32)
-            
-            # Fill in actual values
+            status = torch.zeros(max_seq_len, dtype=torch.long)
+            input_sz = torch.zeros(max_seq_len, dtype=torch.float32)
+            output_sz = torch.zeros(max_seq_len, dtype=torch.float32)
+            gas_v = torch.zeros(max_seq_len, dtype=torch.float32)
+
             call_type[:max_len] = torch.from_numpy(trace_feat['call_type_ids'][:max_len]).long()
             contract[:max_len] = torch.from_numpy(trace_feat['contract_ids'][:max_len]).long()
             func_id[:max_len] = torch.from_numpy(trace_feat['func_ids'][:max_len]).long()
             depth[:max_len] = torch.from_numpy(trace_feat['depth_ids'][:max_len]).long()
-            exec_prop[:max_len] = torch.from_numpy(trace_feat['exec_properties'][:max_len]).float()
+            status[:max_len] = torch.from_numpy(trace_feat['status_ids'][:max_len]).long()
+            input_sz[:max_len] = torch.from_numpy(trace_feat['input_sizes'][:max_len]).float()
+            output_sz[:max_len] = torch.from_numpy(trace_feat['output_sizes'][:max_len]).float()
+            gas_v[:max_len] = torch.from_numpy(trace_feat['gas_vals'][:max_len]).float()
             
             # Attention mask: True for valid positions
             mask = torch.zeros(max_seq_len, dtype=torch.bool)
@@ -792,7 +843,10 @@ def collate_graph_batch(
             all_contract_ids.append(contract)
             all_func_selector_ids.append(func_id)
             all_depths.append(depth)
-            all_exec_properties.append(exec_prop)
+            all_status_ids.append(status)
+            all_input_sizes.append(input_sz)
+            all_output_sizes.append(output_sz)
+            all_gas_vals.append(gas_v)
             all_trace_masks.append(mask)
         
         # Labels (one per edge)
@@ -814,26 +868,32 @@ def collate_graph_batch(
     if num_edges_total == 0:
         # Empty batch - return zeros
         return {
-            'external_features': torch.zeros((0, 7), dtype=torch.float32),
+            'external_features': torch.zeros((0, 4), dtype=torch.float32),
             'call_type_ids': torch.zeros((0, max_seq_len), dtype=torch.long),
             'contract_ids': torch.zeros((0, max_seq_len), dtype=torch.long),
             'func_selector_ids': torch.zeros((0, max_seq_len), dtype=torch.long),
             'depths': torch.zeros((0, max_seq_len), dtype=torch.long),
-            'exec_properties': torch.zeros((0, max_seq_len, 4), dtype=torch.float32),
+            'status_ids': torch.zeros((0, max_seq_len), dtype=torch.long),
+            'input_sizes': torch.zeros((0, max_seq_len), dtype=torch.float32),
+            'output_sizes': torch.zeros((0, max_seq_len), dtype=torch.float32),
+            'gas_vals': torch.zeros((0, max_seq_len), dtype=torch.float32),
             'trace_mask': torch.zeros((0, max_seq_len), dtype=torch.bool),
             'labels': torch.zeros((0,), dtype=torch.long)
         }
     
     # Stack tensors
     return {
-        'external_features': torch.stack(all_external_features),  # (num_edges, 7)
-        'call_type_ids': torch.stack(all_call_type_ids),  # (num_edges, seq_len)
+        'external_features': torch.stack(all_external_features),  # (num_edges, 4)
+        'call_type_ids': torch.stack(all_call_type_ids),
         'contract_ids': torch.stack(all_contract_ids),
         'func_selector_ids': torch.stack(all_func_selector_ids),
         'depths': torch.stack(all_depths),
-        'exec_properties': torch.stack(all_exec_properties),  # (num_edges, seq_len, 4)
-        'trace_mask': torch.stack(all_trace_masks),  # (num_edges, seq_len)
-        'labels': torch.cat(all_labels),  # (num_edges,)
+        'status_ids': torch.stack(all_status_ids),
+        'input_sizes': torch.stack(all_input_sizes),
+        'output_sizes': torch.stack(all_output_sizes),
+        'gas_vals': torch.stack(all_gas_vals),
+        'trace_mask': torch.stack(all_trace_masks),
+        'labels': torch.cat(all_labels),
         'num_edges': num_edges_total
     }
 
@@ -867,18 +927,29 @@ class GraphWindowDataset(torch.utils.data.Dataset):
         num_edges = graph['num_edges']
         max_seq_len = self.MAX_SEQ_LEN
 
+        if num_edges > 0:
+            tf0 = graph['edge_features'][0]['trace_features']
+            _req = ('status_ids', 'input_sizes', 'output_sizes', 'gas_vals')
+            if not all(k in tf0 for k in _req):
+                raise ValueError(
+                    "Graph cache format is outdated. Rebuild with force_rebuild=True."
+                )
+
         # Pre-allocate edge-level tensors
-        external_features = np.zeros((num_edges, 6), dtype=np.float32)
+        external_features = np.zeros((num_edges, 4), dtype=np.float32)
         call_type_ids     = np.zeros((num_edges, max_seq_len), dtype=np.int64)
         contract_ids      = np.zeros((num_edges, max_seq_len), dtype=np.int64)
         func_selector_ids = np.zeros((num_edges, max_seq_len), dtype=np.int64)
         depths            = np.zeros((num_edges, max_seq_len), dtype=np.int64)
-        exec_properties   = np.zeros((num_edges, max_seq_len, 4), dtype=np.float32)
+        status_ids        = np.zeros((num_edges, max_seq_len), dtype=np.int64)
+        input_sizes       = np.zeros((num_edges, max_seq_len), dtype=np.float32)
+        output_sizes      = np.zeros((num_edges, max_seq_len), dtype=np.float32)
+        gas_vals          = np.zeros((num_edges, max_seq_len), dtype=np.float32)
         trace_masks       = np.zeros((num_edges, max_seq_len), dtype=bool)
 
         for i, edge_feat in enumerate(graph['edge_features']):
-            ext = np.asarray(edge_feat['external_features'], dtype=np.float32)
-            external_features[i, :len(ext)] = ext[:6]  # clip to 6 dims
+            ext = _external_features_to_dim4(edge_feat['external_features'])
+            external_features[i, :] = ext
 
             tf = edge_feat['trace_features']
             seq_len = tf['sequence_length']
@@ -888,7 +959,10 @@ class GraphWindowDataset(torch.utils.data.Dataset):
                 contract_ids[i, :max_len]         = tf['contract_ids'][:max_len]
                 func_selector_ids[i, :max_len]    = tf['func_ids'][:max_len]
                 depths[i, :max_len]               = tf['depth_ids'][:max_len]
-                exec_properties[i, :max_len]      = tf['exec_properties'][:max_len]
+                status_ids[i, :max_len]           = tf['status_ids'][:max_len]
+                input_sizes[i, :max_len]          = tf['input_sizes'][:max_len]
+                output_sizes[i, :max_len]         = tf['output_sizes'][:max_len]
+                gas_vals[i, :max_len]             = tf['gas_vals'][:max_len]
                 trace_masks[i, :max_len]          = True
 
         edge_index_np = graph['edge_index']          # (2, E) numpy
@@ -898,13 +972,16 @@ class GraphWindowDataset(torch.utils.data.Dataset):
 
         return {
             # Edge-level features
-            'external_features':  torch.from_numpy(external_features),   # (E, 6)
-            'call_type_ids':      torch.from_numpy(call_type_ids),        # (E, 256)
+            'external_features':  torch.from_numpy(external_features),   # (E, 4)
+            'call_type_ids':      torch.from_numpy(call_type_ids),
             'contract_ids':       torch.from_numpy(contract_ids),
             'func_selector_ids':  torch.from_numpy(func_selector_ids),
             'depths':             torch.from_numpy(depths),
-            'exec_properties':    torch.from_numpy(exec_properties),      # (E, 256, 4)
-            'trace_mask':         torch.from_numpy(trace_masks),          # (E, 256)
+            'status_ids':         torch.from_numpy(status_ids),
+            'input_sizes':        torch.from_numpy(input_sizes),
+            'output_sizes':       torch.from_numpy(output_sizes),
+            'gas_vals':           torch.from_numpy(gas_vals),
+            'trace_mask':         torch.from_numpy(trace_masks),
             'labels':             torch.from_numpy(
                                       np.asarray(graph['edge_labels'], dtype=np.int64)
                                   ),                                       # (E,)
