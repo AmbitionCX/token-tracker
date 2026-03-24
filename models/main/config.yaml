@@ -1,0 +1,170 @@
+# ============================================
+# GNN Model Configuration
+# ============================================
+
+# Data Configuration
+data:
+  # PostgreSQL connection (inherited from .env)
+  table_name: "tx_joined_4000000_4010000"
+  start_block: 4000000
+  end_block: 4010000
+  chunk_size: 5000
+  
+  # Temporal window configuration
+  window_size: 1000  # Δ = 1000 blocks (~2.5 hours)
+  
+  # Data split (time-series split to avoid leakage)
+  train_ratio: 0.8
+  val_ratio: 0.1
+  test_ratio: 0.1
+  
+  # Cache configuration
+  cache_enabled: true
+  cache_dir: "./cache"
+
+# Feature Engineering
+features:
+  # External transaction features
+  external:
+    - value
+    - gas_used
+    - calldata_length
+    - is_contract_call
+    - is_revert
+    - nonce_position
+  
+  # Trace features
+  trace:
+    max_sequence_length: 256
+    embedding_dim: 128
+    
+  # Dimensions
+  external_dim: 6
+  trace_dim: 128
+  total_edge_dim: 134
+
+# Model Configuration
+model:
+  # Trace Encoder
+  trace_encoder:
+    type: "transformer"  # Options: transformer, lstm, pooling
+    hidden_dim: 128
+    num_layers: 2
+    num_heads: 4  # For transformer
+    dropout: 0.1
+    activation: "relu"
+  
+  # GNN Module
+  gnn:
+    type: "gat"  # Options: gat, gcn, graphsage
+    num_layers: 2
+    hidden_dim: 128
+    edge_dim: 135  # Edge features dimension
+    dropout: 0.1
+    num_heads: 4  # For GAT
+  
+  # Attention Aggregator
+  attention:
+    hidden_dim: 64
+    num_heads: 4
+  
+  # Final classifier
+  classifier:
+    hidden_dim: 64
+    num_classes: 2  # Binary: suspicious / normal
+
+# Training Configuration
+training:
+  device: "cuda"  # Options: cuda, cpu
+  batch_size: 32
+  num_epochs: 50
+  learning_rate: 0.001
+  weight_decay: 1e-5
+  
+  # Loss function
+  loss_fn: "weighted_crossentropy"  # Handle imbalanced data
+  positive_weight: 10.0  # Weight for suspicious class
+  
+  # Optimizer
+  optimizer: "adam"
+  
+  # Scheduler
+  scheduler:
+    type: "cosine"
+    warmup_steps: 500
+    total_steps: -1  # Will be computed based on data
+  
+  # Callbacks
+  early_stopping:
+    patience: 10
+    min_delta: 1e-4
+    
+  checkpoint:
+    save_dir: "./checkpoints"
+    save_freq: 5  # Every N epochs
+    keep_best: true
+
+# Evaluation Metrics
+metrics:
+  - accuracy
+  - precision
+  - recall
+  - f1
+  - auc
+  - confusion_matrix
+
+# Baseline Models Configuration
+baselines:
+  traditional:
+    - logistic_regression
+    - random_forest
+    - xgboost
+  
+  graph_only:
+    - gcn
+    - graphsage
+    - gat
+  
+  sequence_only:
+    - rnn
+    - transformer
+
+# Ablation Experiments
+ablations:
+  exp_a:
+    name: "No Trace Features"
+    trace_enabled: false
+    gnn_enabled: true
+    attention_enabled: true
+  
+  exp_b:
+    name: "No GNN (Direct Classification)"
+    trace_enabled: true
+    gnn_enabled: false
+    attention_enabled: true
+  
+  exp_c:
+    name: "No Attention (Simple Concatenation)"
+    trace_enabled: true
+    gnn_enabled: true
+    attention_enabled: false
+  
+  exp_d:
+    name: "Different TraceEncoders"
+    trace_encoder_types:
+      - transformer
+      - lstm
+      - pooling
+    gnn_enabled: true
+    attention_enabled: true
+
+# Logging and Logging Configuration
+logging:
+  level: "INFO"
+  log_dir: "./logs"
+  log_file: "train.log"
+  tensorboard_dir: "./runs"
+  log_freq: 100  # Log every N steps
+
+# Random Seeds for Reproducibility
+random_seed: 42
