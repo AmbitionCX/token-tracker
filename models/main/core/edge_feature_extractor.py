@@ -426,7 +426,7 @@ class EdgeFeatureExtractor(nn.Module):
             # Per-token embeddings: (batch, seq_len, 8*embedding_dim)
             trace_emb = self.call_event_embedding(
                 call_type_ids, contract_ids, func_selector_ids, depths,
-                status_ids, input_sizes, output_sizes, gas_vals
+                status_ids, input_sizes, output_sizes, gas_vals, trace_mask
             )
             trace_emb = self.trace_dim_proj(trace_emb)  # (batch, seq_len, trace_embedding_dim)
 

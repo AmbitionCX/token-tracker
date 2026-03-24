@@ -270,39 +270,50 @@ class TemporalGraphWithTraces:
     def finalize(self) -> Dict[str, Any]:
         """
         Finalize graph structure and convert to PyTorch format.
-        
-        Returns:
-            Dictionary with PyTorch tensors ready for GNN
+
+        Node features s_v (§5.1):
+            s_v = [log(1+total_tx), log(1+in_degree), log(1+out_degree)]
         """
-        # Create node index mapping V_k → {0, 1, ..., |V_k|-1}
         sorted_nodes = sorted(self.nodes_set)
         self.node_to_idx = {addr: idx for idx, addr in enumerate(sorted_nodes)}
         num_nodes = len(sorted_nodes)
-        
-        # Convert edges to edge_index format (2, num_edges)
-        edge_index = []
-        for i, edge in enumerate(self.edges):
-            from_idx = self.node_to_idx[edge['from']]
-            to_idx = self.node_to_idx[edge['to']]
-            edge_index.append([from_idx, to_idx])
-        
-        if edge_index:
-            edge_index = np.array(edge_index).T  # (2, num_edges)
+
+        # Accumulate per-node statistics while building edge_index
+        total_tx  = np.zeros(num_nodes, dtype=np.float32)
+        in_degree  = np.zeros(num_nodes, dtype=np.float32)
+        out_degree = np.zeros(num_nodes, dtype=np.float32)
+
+        edge_index_list = []
+        for edge in self.edges:
+            u = self.node_to_idx[edge['from']]
+            v = self.node_to_idx[edge['to']]
+            edge_index_list.append([u, v])
+            total_tx[u] += 1
+            total_tx[v] += 1
+            out_degree[u] += 1
+            in_degree[v] += 1
+
+        if edge_index_list:
+            edge_index = np.array(edge_index_list, dtype=np.int64).T  # (2, E)
         else:
             edge_index = np.zeros((2, 0), dtype=np.int64)
-        
-        # Create node features (initialized as zeros + will be updated by GNN)
-        node_features = np.zeros((num_nodes, 7), dtype=np.float32)  # Placeholder
-        
+
+        # Node feature matrix (N, 3): log(1+·) normalised statistics
+        node_features = np.stack([
+            np.log1p(total_tx),
+            np.log1p(in_degree),
+            np.log1p(out_degree),
+        ], axis=1).astype(np.float32)  # (N, 3)
+
         return {
             'num_nodes': num_nodes,
             'num_edges': len(self.edges),
             'edge_index': edge_index,
             'edge_features': self.edge_features,
             'edge_labels': np.array(self.edge_labels, dtype=np.int64),
-            'node_features': node_features,
+            'node_features': node_features,          # (N, 3)
             'node_to_idx': self.node_to_idx,
-            'nodes': sorted_nodes
+            'nodes': sorted_nodes,
         }
 
 
@@ -966,9 +977,10 @@ class GraphWindowDataset(torch.utils.data.Dataset):
                 trace_masks[i, :max_len]          = True
 
         edge_index_np = graph['edge_index']          # (2, E) numpy
-        node_feats_np = graph.get('node_features')   # (N, D) numpy or None
+        node_feats_np = graph.get('node_features')   # (N, 3) numpy or None
         if node_feats_np is None:
-            node_feats_np = np.zeros((graph['num_nodes'], 6), dtype=np.float32)
+            # Fallback for old cache: zero-filled (N, 3)
+            node_feats_np = np.zeros((graph['num_nodes'], 3), dtype=np.float32)
 
         return {
             # Edge-level features

@@ -26,7 +26,7 @@ from core import (
     EdgeRepresentationAggregator,
     build_neighborhood_graph
 )
-from .gnn_base import GNNBase
+from .gnn_base import GNNBase, NodeInitMLP
 
 
 class SequenceGNNModel(nn.Module):
@@ -108,25 +108,30 @@ class SequenceGNNModel(nn.Module):
                 dropout=dropout
             )
         
-        # ===== MODULE 2: GNN for Node Representation =====
-        # Initialize GNN (node features TBD at inference time)
-        node_initial_feat_dim = 10  # Placeholder (EOA/contract type, etc.)
-        
+        # ===== MODULE 2: Node initialisation + GNN =====
+        # s_v = [log(1+total_tx), log(1+in_deg), log(1+out_deg)]  (3-dim)
+        node_stat_dim = 3
+        node_init_dim = gnn_hidden_dim  # h_v^(0) ∈ R^{gnn_hidden_dim}
+
+        self.node_init_mlp = NodeInitMLP(
+            stat_dim=node_stat_dim,
+            hidden_dim=gnn_hidden_dim // 2,
+            output_dim=node_init_dim,
+        )
+
         if use_gnn:
             self.gnn = GNNBase(
-                input_dim=node_initial_feat_dim,
+                input_dim=node_init_dim,
                 hidden_dim=gnn_hidden_dim,
                 output_dim=gnn_hidden_dim,
                 num_layers=gnn_num_layers,
                 gnn_type=gnn_type,
                 num_heads=gnn_num_heads,
                 dropout=dropout,
-                edge_dim=edge_dim if gnn_type == "gat" else None
+                edge_dim=edge_dim if gnn_type == "gat" else None,
             )
         else:
-            # No GNN: use dummy node representations
             self.gnn = None
-            self.dummy_node_proj = nn.Linear(node_initial_feat_dim, gnn_hidden_dim)
         
         # ===== MODULE 3: Edge Attention Aggregation =====
         if use_attention:
@@ -220,7 +225,12 @@ class SequenceGNNModel(nn.Module):
                 input_sizes,
                 output_sizes,
                 gas_vals,
+                trace_mask,
             )  # (batch_size, seq_len, call_event_embedding.output_dim)
+            # Zero padding positions before the Transformer so attention backward does not
+            # inject unstable gradients into embedding / linear rows used only for pad tokens.
+            if trace_mask is not None:
+                trace_emb = trace_emb * trace_mask.unsqueeze(-1).float()
             # TraceEncoder's internal input_proj handles the projection to hidden_dim
             
             # Encode trace sequence
@@ -235,27 +245,31 @@ class SequenceGNNModel(nn.Module):
         else:
             edge_features = trace_repr  # "Trace only" models: skip external features
         
-        # ===== STEP 3: Graph Neural Network (optional) =====
-        if self.use_gnn and node_features is not None and edge_index is not None:
-            # Forward through GNN
-            node_repr = self.gnn(node_features, edge_index, edge_features)
-            # (num_nodes_in_batch, gnn_hidden_dim)
-            
-            # Get source and target node representations for edges in batch
-            if edge_indices_in_batch is not None:
-                edge_src_idx = edge_index[0, edge_indices_in_batch]
-                edge_dst_idx = edge_index[1, edge_indices_in_batch]
-                h_u = node_repr[edge_src_idx]  # (batch_size, gnn_hidden_dim)
-                h_v = node_repr[edge_dst_idx]  # (batch_size, gnn_hidden_dim)
-            else:
-                # Fallback: assume edges are already in batch order
-                h_u = torch.zeros(batch_size, node_repr.size(-1), device=device)
-                h_v = torch.zeros(batch_size, node_repr.size(-1), device=device)
+        # ===== STEP 3: Node initialisation + GNN =====
+        # h_v^(0) = NodeInitMLP(s_v)  where s_v ∈ R^3
+        if node_features is not None:
+            node_h0 = self.node_init_mlp(node_features.to(device))  # (N, gnn_hidden_dim)
         else:
-            # No GNN: use dummy representations from initial node features
-            gnn_hidden_dim = self.gnn.hidden_dim if self.gnn else 128
-            h_u = torch.zeros(batch_size, gnn_hidden_dim, device=device)
-            h_v = torch.zeros(batch_size, gnn_hidden_dim, device=device)
+            node_h0 = None
+
+        if self.use_gnn and node_h0 is not None and edge_index is not None:
+            # h_v^(K) via multi-layer edge-aware GAT message passing
+            node_repr = self.gnn(node_h0, edge_index, edge_features)
+            # (N, gnn_hidden_dim)
+
+            # Retrieve h_u, h_v for edges in this batch
+            if edge_indices_in_batch is not None:
+                src = edge_index[0, edge_indices_in_batch]
+                dst = edge_index[1, edge_indices_in_batch]
+            else:
+                src = edge_index[0]
+                dst = edge_index[1]
+            h_u = node_repr[src]  # (batch_size, gnn_hidden_dim)
+            h_v = node_repr[dst]
+        else:
+            gnn_dim = self.gnn.hidden_dim if self.gnn else 128
+            h_u = torch.zeros(batch_size, gnn_dim, device=device)
+            h_v = torch.zeros(batch_size, gnn_dim, device=device)
         
         # ===== STEP 4: Edge Attention Aggregation (optional) =====
         if self.use_attention and neighbor_edges is not None:

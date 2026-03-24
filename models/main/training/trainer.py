@@ -447,6 +447,7 @@ class GNNWindowTrainer:
                 window['input_sizes'][s:e].to(self.device),
                 window['output_sizes'][s:e].to(self.device),
                 window['gas_vals'][s:e].to(self.device),
+                window['trace_mask'][s:e].to(self.device),
             )
             chunk_repr = self.model.trace_encoder(
                 chunk_emb,

@@ -1,21 +1,220 @@
 """
-GNN Base Module: Graph Neural Network for node representation learning
+GNN Base Module: Node initialisation + Graph Attention Network
 
-Implements different GNN architectures (GCN, GraphSAGE, GAT) for learning
-node representations that capture address behavior in the transaction graph.
+Implements §5 of the paper:
+  - NodeInitMLP  : h_v^(0) = MLP(s_v)   where s_v = [total_tx, in_deg, out_deg]
+  - EdgeAwareGATLayer : message passing with edge features in attention weight
+      h_v^(k+1) = σ( Σ_{u∈N(v)} α_{uv}^(k) · W^(k) [h_u^(k) ; x_{u→v}] )
+      α_{uv}^(k) = softmax_u( LeakyReLU( a^T [h_u ; h_v ; x_{u→v}] ) )
+  - GNNBase : multi-layer wrapper (GAT / GCN / GraphSAGE)
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn import Parameter
-from typing import Optional, Tuple
+from typing import Optional
 import math
 
 
-class GATConvLayer(nn.Module):
-    """Graph Attention Network (GAT) layer."""
-    
+# ===========================================================================
+# §5.1 Node initialisation
+# ===========================================================================
+
+class NodeInitMLP(nn.Module):
+    """
+    Maps per-address statistics s_v to an initial node embedding h_v^(0).
+
+    s_v = [total_tx_count, in_degree, out_degree]  — 3-dim log-normalised vector
+    h_v^(0) = MLP(s_v)  = LayerNorm( ReLU( W_2 · ReLU( W_1 · s_v ) ) )
+    """
+
+    def __init__(self, stat_dim: int = 3, hidden_dim: int = 32, output_dim: int = 64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(stat_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Linear(hidden_dim, output_dim),
+            nn.LayerNorm(output_dim),
+        )
+
+    def forward(self, node_stats: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            node_stats: (N, stat_dim) — log(1+x) normalised statistics
+        Returns:
+            (N, output_dim)
+        """
+        return self.net(node_stats)
+
+
+# ===========================================================================
+# §5.1  Edge-aware GAT layer
+# ===========================================================================
+
+class EdgeAwareGATLayer(nn.Module):
+    """
+    Single GAT layer that incorporates edge features in both the message and
+    the attention coefficient (matches the paper's formulation exactly).
+
+    Message :  W^(k) · [h_u^(k) ; x_{u→v}]
+    Attention: a^T · LeakyReLU( W_a · [h_u ; h_v ; x_{u→v}] )
+    """
+
+    def __init__(
+        self,
+        node_in: int,
+        node_out: int,
+        edge_dim: int,
+        num_heads: int = 4,
+        dropout: float = 0.1,
+        concat: bool = True,
+        negative_slope: float = 0.2,
+    ):
+        super().__init__()
+
+        self.num_heads = num_heads
+        self.concat = concat
+        self.negative_slope = negative_slope
+        self.dropout = nn.Dropout(dropout)
+
+        # concat=True : output = num_heads * head_dim = node_out  → head_dim = node_out // num_heads
+        # concat=False: output = mean(heads) ∈ R^{node_out}       → each head outputs node_out
+        if concat:
+            if node_out % num_heads != 0:
+                raise ValueError(
+                    f"node_out ({node_out}) must be divisible by num_heads ({num_heads}) "
+                    f"when concat=True"
+                )
+            self.head_dim = node_out // num_heads
+        else:
+            self.head_dim = node_out  # each head → node_out; averaged → node_out
+
+        self.out_dim = num_heads * self.head_dim  # total dim after msg_proj
+
+        # Message transform: W · [h_u ; x_{u→v}]  (per head)
+        self.msg_proj = nn.Linear(node_in + edge_dim, self.out_dim, bias=False)
+
+        # Attention vector: a^T · [h_u ; h_v ; x_{u→v}]  (per head, scalar output)
+        self.att_proj = nn.Linear(node_in + node_in + edge_dim, num_heads, bias=False)
+
+        final_dim = num_heads * self.head_dim if concat else self.head_dim
+        self.bias = nn.Parameter(torch.zeros(final_dim))
+        self.norm = nn.LayerNorm(final_dim)
+
+        self._reset()
+
+    def _reset(self):
+        nn.init.xavier_uniform_(self.msg_proj.weight)
+        nn.init.xavier_uniform_(self.att_proj.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,          # (N, node_in)
+        edge_index: torch.Tensor,  # (2, E)
+        edge_attr: torch.Tensor,   # (E, edge_dim)
+    ) -> torch.Tensor:
+        """
+        Returns:
+            (N, node_out) — concatenated or averaged multi-head output
+        """
+        N = x.size(0)
+        src, dst = edge_index  # src = u (source), dst = v (target)
+
+        # --- messages: W · [h_u ; x_{u→v}] ---
+        msg_input = torch.cat([x[src], edge_attr], dim=-1)      # (E, node_in + edge_dim)
+        msgs = self.msg_proj(msg_input)                          # (E, H*head_dim)
+        msgs = msgs.view(-1, self.num_heads, self.head_dim)      # (E, H, head_dim)
+
+        # --- attention coefficients ---
+        att_input = torch.cat([x[src], x[dst], edge_attr], dim=-1)  # (E, 2*node_in + edge_dim)
+        att_logits = self.att_proj(att_input)                        # (E, H)
+        att_logits = F.leaky_relu(att_logits, self.negative_slope)
+
+        # Softmax over incoming edges per destination node
+        att = self._sparse_softmax(att_logits, dst, N)           # (E, H)
+        att = self.dropout(att)
+
+        # --- aggregate ---
+        weighted = msgs * att.unsqueeze(-1)                      # (E, H, head_dim)
+        out = torch.zeros(N, self.num_heads, self.head_dim, device=x.device, dtype=x.dtype)
+        out.scatter_add_(0, dst.view(-1, 1, 1).expand_as(weighted), weighted)
+
+        if self.concat:
+            out = out.reshape(N, self.num_heads * self.head_dim)
+        else:
+            out = out.mean(dim=1)                                # (N, head_dim)
+
+        out = out + self.bias
+        out = self.norm(out)
+        return out
+
+    @staticmethod
+    def _sparse_softmax(logits: torch.Tensor, index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+        """Per-node softmax over incoming edge logits. logits: (E, H)."""
+        # Numerical stability: subtract max per destination node
+        max_per_node = torch.full(
+            (num_nodes, logits.size(1)), float('-inf'), device=logits.device, dtype=logits.dtype
+        )
+        max_per_node.scatter_reduce_(
+            0, index.unsqueeze(-1).expand_as(logits), logits, reduce='amax', include_self=True
+        )
+        logits_shifted = logits - max_per_node[index]
+        exp_logits = torch.exp(logits_shifted)
+
+        sum_per_node = torch.zeros(num_nodes, logits.size(1), device=logits.device, dtype=logits.dtype)
+        sum_per_node.scatter_add_(0, index.unsqueeze(-1).expand_as(exp_logits), exp_logits)
+
+        return exp_logits / (sum_per_node[index] + 1e-9)
+
+
+# ===========================================================================
+# GCN layer (kept for ablation)
+# ===========================================================================
+
+class GCNConvLayer(nn.Module):
+    """Graph Convolutional Network layer (symmetric normalisation)."""
+
+    def __init__(self, in_features: int, out_features: int, dropout: float = 0.1):
+        super().__init__()
+        self.lin = nn.Linear(in_features, out_features)
+        self.dropout = nn.Dropout(dropout)
+        nn.init.xavier_uniform_(self.lin.weight)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        edge_index: torch.Tensor,
+        edge_weight: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        N = x.size(0)
+        src, dst = edge_index
+
+        # Add self-loops
+        self_idx = torch.arange(N, device=x.device)
+        ei = torch.cat([edge_index, self_idx.unsqueeze(0).expand(2, -1)], dim=1)
+
+        # Degree normalisation
+        deg = torch.zeros(N, device=x.device)
+        deg.scatter_add_(0, ei[1], torch.ones(ei.size(1), device=x.device))
+        deg_inv_sqrt = deg.pow(-0.5).clamp(max=1e6)
+
+        x = self.lin(self.dropout(x))
+        norm = deg_inv_sqrt[ei[0]] * deg_inv_sqrt[ei[1]]
+        msgs = x[ei[0]] * norm.unsqueeze(-1)
+
+        out = torch.zeros_like(x)
+        out.scatter_add_(0, ei[1].unsqueeze(-1).expand_as(msgs), msgs)
+        return out
+
+
+# ===========================================================================
+# GATConvLayer  — thin alias kept for backward compat
+# ===========================================================================
+
+class GATConvLayer(EdgeAwareGATLayer):
+    """Backward-compatible alias for EdgeAwareGATLayer."""
+
     def __init__(
         self,
         in_features: int,
@@ -23,223 +222,40 @@ class GATConvLayer(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.1,
         concat: bool = True,
-        edge_dim: Optional[int] = None
+        edge_dim: Optional[int] = None,
     ):
-        """
-        Args:
-            in_features: Input feature dimension
-            out_features: Output feature dimension (per head if concat=True)
-            num_heads: Number of attention heads
-            dropout: Dropout rate
-            concat: If True, concatenate heads; else average
-            edge_dim: Dimension of edge features (for GAT with edge attention)
-        """
-        super().__init__()
-        
-        self.in_features = in_features
-        self.out_features = out_features
-        self.num_heads = num_heads
-        self.concat = concat
-        self.dropout = dropout
-        self.edge_dim = edge_dim
-        
-        if out_features % num_heads != 0:
-            raise ValueError(
-                f"out_features ({out_features}) must be divisible by "
-                f"num_heads ({num_heads})"
-            )
-        
-        self.head_dim = out_features // num_heads
-        
-        # Linear transformations
-        self.lin = nn.Linear(in_features, num_heads * self.head_dim, bias=False)
-        
-        # Attention weights
-        self.att_l = Parameter(torch.Tensor(num_heads, self.head_dim, 1))
-        self.att_r = Parameter(torch.Tensor(num_heads, self.head_dim, 1))
-        
-        # Edge features (if provided)
-        self.lin_edge = None
-        if edge_dim:
-            self.lin_edge = nn.Linear(edge_dim, num_heads * self.head_dim, bias=False)
-        
-        # Bias and normalization
-        if concat:
-            self.bias = Parameter(torch.Tensor(num_heads * self.head_dim))
-        else:
-            self.bias = Parameter(torch.Tensor(self.head_dim))
-        
-        self.reset_parameters()
-        self.dropout_layer = nn.Dropout(dropout)
-    
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.lin.weight)
-        nn.init.xavier_uniform_(self.att_l)
-        nn.init.xavier_uniform_(self.att_r)
-        nn.init.zeros_(self.bias)
-        if self.lin_edge:
-            nn.init.xavier_uniform_(self.lin_edge.weight)
-    
-    def forward(
-        self,
-        x: torch.Tensor,                    # (num_nodes, in_features)
-        edge_index: torch.Tensor,          # (2, num_edges)
-        edge_attr: Optional[torch.Tensor] = None  # (num_edges, edge_dim)
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: Node feature matrix
-            edge_index: COO edge indices
-            edge_attr: Edge feature matrix (optional)
-        
-        Returns:
-            (num_nodes, out_features) node representations
-        """
-        num_nodes = x.size(0)
-        
-        # Project nodes to multiple heads
-        x = self.lin(x)  # (num_nodes, num_heads * head_dim)
-        x = x.view(-1, self.num_heads, self.head_dim)  # (num_nodes, num_heads, head_dim)
-        
-        # Compute attention coefficients
-        from_idx, to_idx = edge_index
-        
-        # Attention scores from source nodes
-        att_l = torch.einsum('nhd,ndl->nhl', x, self.att_l)  # (num_nodes, num_heads, 1)
-        att_l = att_l[from_idx]  # (num_edges, num_heads, 1)
-        
-        # Attention scores from target nodes
-        att_r = torch.einsum('nhd,ndl->nhl', x, self.att_r)
-        att_r = att_r[to_idx]  # (num_edges, num_heads, 1)
-        
-        # Combine
-        att = att_l + att_r  # (num_edges, num_heads, 1)
-        
-        # Add edge features if available
-        if edge_attr is not None and self.lin_edge is not None:
-            edge_feat = self.lin_edge(edge_attr)  # (num_edges, num_heads * head_dim)
-            edge_feat = edge_feat.view(-1, self.num_heads, self.head_dim)
-            att = att + torch.sum(
-                x[from_idx] * edge_feat, dim=-1, keepdim=True
-            ) / (self.head_dim ** 0.5)
-        
-        # Apply LeakyReLU and softmax
-        att = F.leaky_relu(att, negative_slope=0.2)
-        att = att.squeeze(-1)  # (num_edges, num_heads)
-        
-        # Softmax normalization per node
-        att = self._softmax(att, to_idx, num_nodes)
-        att = self.dropout_layer(att)
-        
-        # Apply attention to values
-        x_j = x[from_idx]  # (num_edges, num_heads, head_dim)
-        out = torch.einsum('eh,ehd->nhd', att, x_j)  # (num_nodes, num_heads, head_dim)
-        
-        if self.concat:
-            out = out.contiguous().view(-1, self.num_heads * self.head_dim)
-        else:
-            out = out.mean(dim=1)
-        
-        out = out + self.bias
-        
-        return out
-    
-    @staticmethod
-    def _softmax(att: torch.Tensor, index: torch.Tensor, num_nodes: int) -> torch.Tensor:
-        """Softmax normalization for attention."""
-        # Convert to sparse tensor for efficient softmax
-        mask = torch.zeros((num_nodes, att.size(0)), device=att.device, dtype=torch.bool)
-        mask[index] = True
-        
-        # Max value per node for numerical stability
-        max_per_node = torch.full((num_nodes, att.size(1)), float('-inf'), device=att.device)
-        max_per_node.scatter_(0, index.unsqueeze(-1).expand(-1, att.size(1)), 
-                               torch.max(att, dim=0)[0].unsqueeze(0))
-        
-        att_exp = torch.exp(att - max_per_node[index])
-        sum_per_node = torch.zeros((num_nodes, att.size(1)), device=att.device)
-        sum_per_node.scatter_add_(0, index.unsqueeze(-1).expand(-1, att.size(1)), att_exp)
-        
-        return att_exp / (sum_per_node[index] + 1e-9)
+        super().__init__(
+            node_in=in_features,
+            node_out=out_features,
+            edge_dim=edge_dim if edge_dim else 1,
+            num_heads=num_heads,
+            dropout=dropout,
+            concat=concat,
+        )
+        self._compat_edge_dim = edge_dim
+
+    def forward(self, x, edge_index, edge_attr=None):
+        if edge_attr is None:
+            # fallback: dummy zero edge features
+            E = edge_index.size(1)
+            edge_attr = torch.zeros(E, self._compat_edge_dim or 1, device=x.device, dtype=x.dtype)
+        return super().forward(x, edge_index, edge_attr)
 
 
-class GCNConvLayer(nn.Module):
-    """Graph Convolutional Network (GCN) layer."""
-    
-    def __init__(
-        self,
-        in_features: int,
-        out_features: int,
-        bias: bool = True,
-        dropout: float = 0.1
-    ):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        
-        self.lin = nn.Linear(in_features, out_features, bias=bias)
-        self.dropout = nn.Dropout(dropout)
-        self.reset_parameters()
-    
-    def reset_parameters(self):
-        nn.init.xavier_uniform_(self.lin.weight)
-        if self.lin.bias is not None:
-            nn.init.zeros_(self.lin.bias)
-    
-    def forward(
-        self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_weight: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
-        """
-        Args:
-            x: (num_nodes, in_features)
-            edge_index: (2, num_edges)
-            edge_weight: (num_edges,) optional edge weights
-        
-        Returns:
-            (num_nodes, out_features)
-        """
-        device = x.device
-        num_nodes = x.size(0)
-        
-        # Compute normalization (D^{-1/2} A D^{-1/2})
-        from_idx, to_idx = edge_index
-        
-        # Add self-loops
-        self_loop = torch.arange(num_nodes, device=device).unsqueeze(0).expand(2, -1)
-        edge_index_with_loops = torch.cat([edge_index, self_loop], dim=1)
-        
-        # Compute degree
-        deg = torch.zeros(num_nodes, device=device)
-        deg.scatter_add_(0, to_idx, torch.ones_like(to_idx, dtype=torch.float))
-        deg.scatter_add_(0, torch.arange(num_nodes, device=device), torch.ones(num_nodes, device=device))
-        
-        deg_inv_sqrt = deg.pow(-0.5)
-        deg_inv_sqrt[deg_inv_sqrt == float('inf')] = 0
-        
-        # Messages
-        x = self.lin(x)
-        x = self.dropout(x)
-        
-        # Aggregation with normalization
-        from_idx_loops, to_idx_loops = edge_index_with_loops
-        messages = x[from_idx_loops] * deg_inv_sqrt[from_idx_loops].unsqueeze(-1) * deg_inv_sqrt[to_idx_loops].unsqueeze(-1)
-        
-        out = torch.zeros_like(x)
-        out.scatter_add_(0, to_idx_loops.unsqueeze(-1).expand_as(messages), messages)
-        
-        return out
-
+# ===========================================================================
+# §5.1  GNNBase — multi-layer wrapper
+# ===========================================================================
 
 class GNNBase(nn.Module):
     """
-    Graph Neural Network base module for node representation learning.
-    
-    Supports multiple GNN architectures: GAT (default), GCN, GraphSAGE.
+    Multi-layer GNN for node representation learning.
+
+    Supports:
+      - 'gat'       : EdgeAwareGATLayer  (default, matches §5.1)
+      - 'gcn'       : GCNConvLayer
+      - 'graphsage' : mean-aggregation SAGEConv (simplified)
     """
-    
+
     def __init__(
         self,
         input_dim: int,
@@ -249,88 +265,93 @@ class GNNBase(nn.Module):
         gnn_type: str = "gat",
         num_heads: int = 4,
         dropout: float = 0.1,
-        edge_dim: Optional[int] = None
+        edge_dim: Optional[int] = None,
     ):
-        """
-        Args:
-            input_dim: Input node feature dimension
-            hidden_dim: Hidden dimension
-            output_dim: Output (final) dimension
-            num_layers: Number of GNN layers
-            gnn_type: Type of GNN ('gat', 'gcn', 'graphsage')
-            num_heads: Number of attention heads (for GAT)
-            dropout: Dropout rate
-            edge_dim: Edge feature dimension (for GAT with edge attention)
-        """
         super().__init__()
-        
+
         self.input_dim = input_dim
         self.hidden_dim = hidden_dim
         self.output_dim = output_dim
         self.num_layers = num_layers
         self.gnn_type = gnn_type
-        self.dropout = dropout
-        
-        if gnn_type not in ["gat", "gcn", "graphsage"]:
+        self.dropout_p = dropout
+        self._edge_dim = edge_dim or 1
+
+        if gnn_type not in ("gat", "gcn", "graphsage"):
             raise ValueError(f"Unknown GNN type: {gnn_type}")
-        
-        # Build layers
+
         self.layers = nn.ModuleList()
-        
-        if gnn_type == "gat":
-            # GAT layers
-            for i in range(num_layers):
-                in_feat = input_dim if i == 0 else hidden_dim
-                out_feat = output_dim if i == num_layers - 1 else hidden_dim
-                
+
+        for i in range(num_layers):
+            in_f = input_dim if i == 0 else hidden_dim
+            # last layer: no concat → output_dim; intermediate: concat → hidden_dim
+            is_last = (i == num_layers - 1)
+            out_f = output_dim if is_last else hidden_dim
+            concat = not is_last
+
+            if gnn_type == "gat":
                 self.layers.append(
-                    GATConvLayer(
-                        in_feat, out_feat,
+                    EdgeAwareGATLayer(
+                        node_in=in_f,
+                        node_out=out_f,
+                        edge_dim=self._edge_dim,
                         num_heads=num_heads,
                         dropout=dropout,
-                        concat=(i < num_layers - 1),  # Concat all but last
-                        edge_dim=edge_dim
+                        concat=concat,
                     )
                 )
-        
-        elif gnn_type == "gcn":
-            # GCN layers
-            for i in range(num_layers):
-                in_feat = input_dim if i == 0 else hidden_dim
-                out_feat = output_dim if i == num_layers - 1 else hidden_dim
-                
-                self.layers.append(
-                    GCNConvLayer(in_feat, out_feat, dropout=dropout)
-                )
-        
-        # Activation
-        self.activation = F.relu
-    
+            elif gnn_type == "gcn":
+                self.layers.append(GCNConvLayer(in_f, out_f, dropout=dropout))
+            elif gnn_type == "graphsage":
+                self.layers.append(_SAGEConvLayer(in_f, out_f, dropout=dropout))
+
     def forward(
         self,
-        x: torch.Tensor,
-        edge_index: torch.Tensor,
-        edge_attr: Optional[torch.Tensor] = None
+        x: torch.Tensor,           # (N, input_dim)
+        edge_index: torch.Tensor,  # (2, E)
+        edge_attr: Optional[torch.Tensor] = None,  # (E, edge_dim)
     ) -> torch.Tensor:
         """
-        Forward pass through GNN layers.
-        
-        Args:
-            x: (num_nodes, input_dim) node features
-            edge_index: (2, num_edges) COO edge indices
-            edge_attr: (num_edges, edge_dim) optional edge features
-        
         Returns:
-            (num_nodes, output_dim) node representations
+            (N, output_dim)
         """
+        if edge_attr is None:
+            E = edge_index.size(1)
+            edge_attr = torch.zeros(E, self._edge_dim, device=x.device, dtype=x.dtype)
+
         for i, layer in enumerate(self.layers):
+            is_last = (i == self.num_layers - 1)
             if self.gnn_type == "gat":
                 x = layer(x, edge_index, edge_attr)
             else:
                 x = layer(x, edge_index)
-            
-            if i < len(self.layers) - 1:
-                x = self.activation(x)
-                x = F.dropout(x, p=self.dropout, training=self.training)
-        
+
+            if not is_last:
+                x = F.relu(x)
+                x = F.dropout(x, p=self.dropout_p, training=self.training)
+
         return x
+
+
+class _SAGEConvLayer(nn.Module):
+    """Mean-aggregation GraphSAGE layer."""
+
+    def __init__(self, in_features: int, out_features: int, dropout: float = 0.1):
+        super().__init__()
+        self.lin_self = nn.Linear(in_features, out_features, bias=False)
+        self.lin_neigh = nn.Linear(in_features, out_features, bias=False)
+        self.norm = nn.LayerNorm(out_features)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor, **_) -> torch.Tensor:
+        N = x.size(0)
+        src, dst = edge_index
+
+        agg = torch.zeros_like(x)
+        count = torch.zeros(N, 1, device=x.device)
+        agg.scatter_add_(0, dst.unsqueeze(-1).expand(-1, x.size(1)), x[src])
+        count.scatter_add_(0, dst.unsqueeze(-1), torch.ones(src.size(0), 1, device=x.device))
+
+        neigh_mean = agg / (count + 1e-9)
+        out = self.lin_self(self.dropout(x)) + self.lin_neigh(neigh_mean)
+        return self.norm(out)

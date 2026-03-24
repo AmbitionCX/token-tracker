@@ -2,7 +2,7 @@
 Model implementations for suspicious transaction detection.
 """
 
-from .gnn_base import GNNBase, GATConvLayer, GCNConvLayer
+from .gnn_base import GNNBase, GATConvLayer, GCNConvLayer, NodeInitMLP, EdgeAwareGATLayer
 from .seq_gnn_model import (
     SequenceGNNModel,
     NoTraceSequenceGNN,
@@ -17,6 +17,8 @@ __all__ = [
     'GNNBase',
     'GATConvLayer',
     'GCNConvLayer',
+    'NodeInitMLP',
+    'EdgeAwareGATLayer',
     
     # Main Models
     'SequenceGNNModel',

@@ -80,7 +80,11 @@ class TransformerTraceEncoder(nn.Module):
             activation=activation,
             batch_first=True
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        # PyTorch 2.x nested-tensor fast path can produce NaNs in training when using
+        # src_key_padding_mask (see nested tensor warning in transformer.py). Disable it.
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, num_layers=num_layers, enable_nested_tensor=False
+        )
         
         # Output projection (for aggregation)
         self.output_proj = nn.Linear(hidden_dim, hidden_dim)
@@ -106,21 +110,24 @@ class TransformerTraceEncoder(nn.Module):
         # Add positional encoding
         x = self.pos_encoding(x)
         
-        # Create attention mask for padding
-        # PyTorch uses True for positions to MASK OUT (ignore)
+        # src_key_padding_mask: True = ignore position. If a row has no valid tokens,
+        # the mask is all-True and PyTorch TransformerEncoder returns NaNs for that row
+        # (forward + backward). Add a sentinel "valid" slot at index 0 for those rows only
+        # so the encoder never sees an all-masked row; pooling still uses the original mask.
         if mask is None:
-            attn_mask = None
+            padding_mask = None
         else:
-            # mask: True for valid, False for padding
-            # attn_mask: True for masking out (inverse)
-            attn_mask = ~mask.unsqueeze(1).unsqueeze(1)  # (batch_size, 1, 1, seq_len)
-        
-        # Apply transformer
-        padding_mask = ~mask if mask is not None else None
+            valid_count = mask.sum(dim=1)
+            empty_seq = valid_count == 0
+            if empty_seq.any():
+                mask_for_transformer = mask.clone()
+                mask_for_transformer[empty_seq, 0] = True
+                padding_mask = ~mask_for_transformer
+            else:
+                padding_mask = ~mask
+
         transformed = self.transformer(x, src_key_padding_mask=padding_mask)
         # (batch_size, seq_len, hidden_dim)
-        # When a row has no valid tokens, padding_mask is all-True and PyTorch's
-        # TransformerEncoder returns NaNs for that row — sanitize before pooling.
         if mask is not None:
             transformed = torch.nan_to_num(transformed, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -398,8 +405,12 @@ class CallEventEmbedding(nn.Module):
         self.call_type_emb = nn.Embedding(call_type_vocab_size, embedding_dim, padding_idx=0)
         self.contract_emb = nn.Embedding(contract_vocab_size, embedding_dim, padding_idx=0)
         self.func_selector_emb = nn.Embedding(func_selector_vocab_size, embedding_dim, padding_idx=0)
-        self.depth_emb = nn.Embedding(depth_max, embedding_dim)
-        self.status_emb = nn.Embedding(2, embedding_dim)   # 0 = empty output, 1 = has output
+        # depth / status: must reserve index 0 for padding only. Data stores raw depth in [0, depth_max-1]
+        # and status in {0,1}; we shift by +1 in forward when trace_mask marks valid positions.
+        self.depth_max = depth_max
+        self.depth_emb = nn.Embedding(depth_max + 1, embedding_dim, padding_idx=0)
+        # 0 = pad, 1 = status 0 (empty output), 2 = status 1
+        self.status_emb = nn.Embedding(3, embedding_dim, padding_idx=0)
 
         # Continuous scalar → Linear projection
         self.input_size_proj = nn.Sequential(
@@ -424,7 +435,8 @@ class CallEventEmbedding(nn.Module):
         status_ids: torch.Tensor,          # (batch, seq_len)  0 or 1
         input_sizes: torch.Tensor,         # (batch, seq_len)  log-normalised
         output_sizes: torch.Tensor,        # (batch, seq_len)  log-normalised
-        gas_vals: torch.Tensor             # (batch, seq_len)  log-normalised
+        gas_vals: torch.Tensor,             # (batch, seq_len)  log-normalised
+        trace_mask: Optional[torch.Tensor] = None,  # (batch, seq_len) True = valid token
     ) -> torch.Tensor:
         """
         Returns:
@@ -433,8 +445,23 @@ class CallEventEmbedding(nn.Module):
         type_emb     = self.call_type_emb(call_type_ids)
         contract_emb = self.contract_emb(contract_ids)
         func_emb     = self.func_selector_emb(func_selector_ids)
-        depth_emb    = self.depth_emb(depths.long())
-        status_emb   = self.status_emb(status_ids.long())
+
+        depth_clamped = depths.long().clamp(0, self.depth_max - 1)
+        depth_shifted = depth_clamped + 1  # 1..depth_max for real depths 0..depth_max-1
+        if trace_mask is not None:
+            depth_ids = torch.where(trace_mask, depth_shifted, torch.zeros_like(depth_shifted))
+        else:
+            depth_ids = depth_shifted
+
+        status_clamped = status_ids.long().clamp(0, 1)
+        status_shifted = status_clamped + 1
+        if trace_mask is not None:
+            status_ids_emb = torch.where(trace_mask, status_shifted, torch.zeros_like(status_shifted))
+        else:
+            status_ids_emb = status_shifted
+
+        depth_emb = self.depth_emb(depth_ids)
+        status_out = self.status_emb(status_ids_emb)
 
         input_emb  = self.input_size_proj(input_sizes.unsqueeze(-1))
         output_emb = self.output_size_proj(output_sizes.unsqueeze(-1))
@@ -442,7 +469,7 @@ class CallEventEmbedding(nn.Module):
 
         combined = torch.cat(
             [type_emb, contract_emb, func_emb, depth_emb,
-             status_emb, input_emb, output_emb, gas_emb],
+             status_out, input_emb, output_emb, gas_emb],
             dim=-1
         )
         return combined

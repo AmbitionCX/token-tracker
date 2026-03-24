@@ -80,7 +80,7 @@ model:
 training:
   device: "cuda"  # Options: cuda, cpu
   batch_size: 512  # edges per batch (see data.batch_size)
-  num_epochs: 50
+  num_epochs: 10
   learning_rate: 0.001
   weight_decay: 1e-5
   
