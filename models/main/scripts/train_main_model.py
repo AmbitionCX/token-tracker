@@ -212,6 +212,9 @@ def train_model(config: dict) -> None:
                 for k, v in batch.items():
                     if k == 'labels':
                         labels = v.to(device) if isinstance(v, torch.Tensor) else v
+                    elif k == 'num_edges':
+                        # Skip num_edges - not needed by model forward
+                        continue
                     elif isinstance(v, torch.Tensor):
                         batch_device[k] = v.to(device)
                     else:

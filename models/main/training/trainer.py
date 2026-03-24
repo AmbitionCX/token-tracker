@@ -117,6 +117,9 @@ class Trainer:
             for k, v in batch.items():
                 if k == 'labels':
                     labels = v.to(self.device) if isinstance(v, torch.Tensor) else v
+                elif k == 'num_edges':
+                    # Skip num_edges - not needed by model forward
+                    continue
                 elif isinstance(v, torch.Tensor):
                     batch_device[k] = v.to(self.device)
                 else:
@@ -181,12 +184,17 @@ class Trainer:
             pbar = tqdm(val_loader, desc=f'Epoch {self.epoch} [Val]')
             
             for batch in pbar:
+                # Move to device
                 batch = {k: v.to(self.device) if isinstance(v, torch.Tensor) else v 
                          for k, v in batch.items()}
                 
+                # Extract labels and num_edges (not needed by model)
+                labels = batch.pop('labels')
+                batch.pop('num_edges', None)
+                
                 try:
                     logits = self.model(**batch)
-                    loss = loss_fn(logits, batch['labels'])
+                    loss = loss_fn(logits, labels)
                 except Exception as e:
                     self.logger.error(f"Validation batch error: {e}")
                     continue
@@ -197,7 +205,7 @@ class Trainer:
                 # Collect predictions
                 preds = torch.argmax(logits, dim=-1)
                 all_preds.append(preds.cpu().numpy())
-                all_labels.append(batch['labels'].cpu().numpy())
+                all_labels.append(labels.cpu().numpy())
                 
                 pbar.set_postfix({'loss': f'{total_loss / max(1, num_batches):.4f}'})
         
