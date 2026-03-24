@@ -92,8 +92,9 @@ class SequenceGNNModel(nn.Module):
         
         # Trace encoder (if enabled)
         if use_trace:
+            trace_input_dim = self.edge_feature_extractor.call_event_embedding.output_dim
             self.trace_encoder = TraceEncoder(
-                input_dim=trace_hidden_dim,  # 5 embeddings × (128/5) = 128
+                input_dim=trace_input_dim,
                 hidden_dim=trace_hidden_dim,
                 encoder_type=trace_encoder_type,
                 num_layers=trace_num_layers,
@@ -201,6 +202,7 @@ class SequenceGNNModel(nn.Module):
             trace_emb = self.edge_feature_extractor.call_event_embedding(
                 call_type_ids, contract_ids, func_selector_ids, depths, exec_properties
             )  # (batch_size, seq_len, trace_embedding_dim)
+            trace_emb = self.edge_feature_extractor.trace_dim_proj(trace_emb)
             
             # Encode trace sequence
             trace_repr = self.trace_encoder(trace_emb, trace_mask)

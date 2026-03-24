@@ -338,6 +338,11 @@ class EdgeFeatureExtractor(nn.Module):
                 depth_max=50,
                 embedding_dim=trace_embedding_dim // 5  # 5 semantic dimensions
             )
+            # When trace_embedding_dim is not divisible by 5, project to requested dim.
+            if self.call_event_embedding.output_dim != trace_embedding_dim:
+                self.trace_dim_proj = nn.Linear(self.call_event_embedding.output_dim, trace_embedding_dim)
+            else:
+                self.trace_dim_proj = nn.Identity()
     
     def extract_edge_features(
         self,
@@ -421,6 +426,7 @@ class EdgeFeatureExtractor(nn.Module):
             trace_emb = self.call_event_embedding(
                 call_type_ids, contract_ids, func_selector_ids, depths, exec_properties
             )  # (batch_size, seq_len, 5*embedding_dim)
+            trace_emb = self.trace_dim_proj(trace_emb)
             
             # Aggregate trace embeddings
             if trace_mask is not None:

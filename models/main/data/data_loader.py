@@ -87,7 +87,7 @@ class TransactionDataLoader:
                 trace_data,
                 timestamp,
                 is_suspicious
-            FROM {self.table_name}
+            FROM {self.table_name} AS tj
             -- Filter transactions that related to erc20
             WHERE EXISTS (
   SELECT 1
@@ -104,9 +104,8 @@ class TransactionDataLoader:
         """
         
         if start_block is not None and end_block is not None:
-            query += f" WHERE block_number BETWEEN {start_block} AND {end_block}"
+            query += f" AND tj.block_number BETWEEN {start_block} AND {end_block}"
         
-        query += " ORDER BY block_number, transaction_index"
         
         try:
             for chunk in pd.read_sql(query, conn, chunksize=chunk_size):

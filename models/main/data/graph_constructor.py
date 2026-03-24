@@ -479,15 +479,107 @@ class GraphDataLoader:
         num_graphs = len(self.graphs)
         train_size = int(num_graphs * train_ratio)
         val_size = int(num_graphs * val_ratio)
-        
-        # Shuffle indices
-        indices = np.arange(num_graphs)
+        test_size = num_graphs - train_size - val_size
+
+        # Determine graph-level binary labels for stratification: has any suspicious edge
+        graph_has_suspicious = np.array([
+            1 if np.any(np.array(graph.get('edge_labels', [])) == 1) else 0
+            for graph in self.graphs
+        ], dtype=np.int32)
+
+        normal_indices = np.where(graph_has_suspicious == 0)[0]
+        suspicious_indices = np.where(graph_has_suspicious == 1)[0]
+
+        # Shuffle groups (if requested)
         if self.shuffle:
-            np.random.shuffle(indices)
-        
-        train_indices = indices[:train_size]
-        val_indices = indices[train_size:train_size + val_size]
-        test_indices = indices[train_size + val_size:]
+            np.random.shuffle(normal_indices)
+            np.random.shuffle(suspicious_indices)
+
+        # Build split with at least one suspicious in each split when possible
+        train_indices = []
+        val_indices = []
+        test_indices = []
+
+        if len(suspicious_indices) >= 3:
+            train_indices.append(suspicious_indices[0])
+            val_indices.append(suspicious_indices[1])
+            test_indices.append(suspicious_indices[2])
+            remaining_suspicious = suspicious_indices[3:]
+        else:
+            # If insufficient suspicious graphs for all splits, keep all in train and continue
+            train_indices.extend(suspicious_indices)
+            remaining_suspicious = np.array([], dtype=int)
+
+        # Distribute remaining suspicious according to ratio
+        if len(remaining_suspicious) > 0:
+            total_alloc = train_size + val_size + test_size - len(train_indices) - len(val_indices) - len(test_indices)
+            if total_alloc <= 0:
+                remaining_suspicious = np.array([], dtype=int)
+            else:
+                # Use proportional allocation by split sizes
+                splits = [train_size, val_size, test_size]
+                cap = [max(0, s - len(a)) for s, a in zip(splits, [train_indices, val_indices, test_indices])]
+                for idx in remaining_suspicious:
+                    # choose split with highest remaining proportion
+                    dist = [cap[0] / max(1, train_size), cap[1] / max(1, val_size), cap[2] / max(1, test_size)]
+                    target = int(np.argmax(dist))
+                    if target == 0 and len(train_indices) < train_size:
+                        train_indices.append(idx)
+                        cap[0] -= 1
+                    elif target == 1 and len(val_indices) < val_size:
+                        val_indices.append(idx)
+                        cap[1] -= 1
+                    elif target == 2 and len(test_indices) < test_size:
+                        test_indices.append(idx)
+                        cap[2] -= 1
+                    else:
+                        # fallback append where has space
+                        if len(train_indices) < train_size:
+                            train_indices.append(idx)
+                        elif len(val_indices) < val_size:
+                            val_indices.append(idx)
+                        elif len(test_indices) < test_size:
+                            test_indices.append(idx)
+
+        # Fill each split up to desired size with normal graphs
+        def fill_split(split_list, target_size):
+            while len(split_list) < target_size and len(normal_indices) > 0:
+                split_list.append(normal_indices[0])
+                normal_indices = normal_indices[1:]
+            return split_list
+
+        # Python closure does not allow rebinding outer normal_indices directly; use new variable
+        normal_remaining = list(normal_indices)
+        def fill(split_list, target_size):
+            nonlocal normal_remaining
+            while len(split_list) < target_size and normal_remaining:
+                split_list.append(normal_remaining.pop(0))
+            return split_list
+
+        train_indices = fill(train_indices, train_size)
+        val_indices = fill(val_indices, val_size)
+        test_indices = fill(test_indices, test_size)
+
+        # Add any leftovers to train/test if something remains
+        leftovers = normal_remaining
+        for idx in leftovers:
+            if len(train_indices) < train_size:
+                train_indices.append(idx)
+            elif len(val_indices) < val_size:
+                val_indices.append(idx)
+            elif len(test_indices) < test_size:
+                test_indices.append(idx)
+            else:
+                break
+
+        # Final check
+        assert len(train_indices) + len(val_indices) + len(test_indices) == num_graphs, \
+            f"Split mismatch: {len(train_indices)}, {len(val_indices)}, {len(test_indices)} vs {num_graphs}"
+
+        # Convert to numpy arrays
+        train_indices = np.array(train_indices, dtype=int)
+        val_indices = np.array(val_indices, dtype=int)
+        test_indices = np.array(test_indices, dtype=int)
         
         # Create datasets
         train_graphs = [self.graphs[i] for i in train_indices]

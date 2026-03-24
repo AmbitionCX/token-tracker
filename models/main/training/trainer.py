@@ -154,7 +154,12 @@ class Trainer:
             if self.writer and self.global_step % 10 == 0:
                 self.writer.add_scalar('train/loss', avg_loss, self.global_step)
         
-        return {'loss': total_loss / max(1, num_batches)}
+        if num_batches == 0:
+            raise RuntimeError(
+                "No training batches were processed successfully. "
+                "Check preceding batch processing errors for root cause."
+            )
+        return {'loss': total_loss / num_batches}
     
     def validate(
         self,
@@ -209,7 +214,12 @@ class Trainer:
                 
                 pbar.set_postfix({'loss': f'{total_loss / max(1, num_batches):.4f}'})
         
-        metrics = {'loss': total_loss / max(1, num_batches)}
+        if num_batches == 0:
+            raise RuntimeError(
+                "No validation batches were processed successfully. "
+                "Check preceding validation batch errors for root cause."
+            )
+        metrics = {'loss': total_loss / num_batches}
         
         # Compute additional metrics
         if metric_fn and all_preds:
