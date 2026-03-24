@@ -42,7 +42,8 @@ class SequenceGNNModel(nn.Module):
     def __init__(
         self,
         # External feature config
-        external_dim: int = 7,
+        external_dim: int = 6,
+        use_external: bool = True,   # False → "Trace only" models
         
         # Trace encoding config
         trace_encoder_type: str = "transformer",  # transformer, lstm, pooling
@@ -50,8 +51,8 @@ class SequenceGNNModel(nn.Module):
         trace_num_layers: int = 2,
         trace_num_heads: int = 4,
         
-        # Edge feature config
-        edge_dim: int = 135,  # 7 external + 128 trace
+        # Edge feature config (computed automatically; kept for backward compat)
+        edge_dim: Optional[int] = None,  # if None, auto = (external_dim if use_external else 0) + trace_hidden_dim
         
         # GNN config
         gnn_type: str = "gat",  # gat, gcn, graphsage
@@ -76,10 +77,15 @@ class SequenceGNNModel(nn.Module):
         super().__init__()
         
         self.external_dim = external_dim
-        self.edge_dim = edge_dim
+        self.use_external = use_external
         self.use_trace = use_trace
         self.use_gnn = use_gnn
         self.use_attention = use_attention
+        
+        # Edge dim auto-computed: external part (0 when use_external=False) + trace part
+        effective_edge_dim = (external_dim if use_external else 0) + trace_hidden_dim
+        self.edge_dim = edge_dim if edge_dim is not None else effective_edge_dim
+        edge_dim = self.edge_dim
         
         # ===== MODULE 1: External + Trace Feature Extraction =====
         # Edge feature extractor (handles external + trace features)
@@ -196,13 +202,16 @@ class SequenceGNNModel(nn.Module):
         batch_size = external_features.size(0)
         device = external_features.device
         
+        # When use_external=False, external_features is still passed in (ignored for edge features)
+        # but used to infer batch_size/device. Callers may pass a zero tensor of correct shape.
+        
         # ===== STEP 1: Extract and encode trace features =====
         if self.use_trace:
             # Get call event embeddings from trace encoder
             trace_emb = self.edge_feature_extractor.call_event_embedding(
                 call_type_ids, contract_ids, func_selector_ids, depths, exec_properties
-            )  # (batch_size, seq_len, trace_embedding_dim)
-            trace_emb = self.edge_feature_extractor.trace_dim_proj(trace_emb)
+            )  # (batch_size, seq_len, call_event_embedding.output_dim)
+            # TraceEncoder's internal input_proj handles the projection to hidden_dim
             
             # Encode trace sequence
             trace_repr = self.trace_encoder(trace_emb, trace_mask)
@@ -211,9 +220,10 @@ class SequenceGNNModel(nn.Module):
             trace_repr = torch.zeros(batch_size, self.edge_feature_extractor.trace_embedding_dim, device=device)
         
         # ===== STEP 2: Combine external + trace features =====
-        # Simple concatenation
-        edge_features = torch.cat([external_features, trace_repr], dim=-1)
-        # (batch_size, edge_dim=135)
+        if self.use_external:
+            edge_features = torch.cat([external_features, trace_repr], dim=-1)
+        else:
+            edge_features = trace_repr  # "Trace only" models: skip external features
         
         # ===== STEP 3: Graph Neural Network (optional) =====
         if self.use_gnn and node_features is not None and edge_index is not None:

@@ -18,6 +18,9 @@ data:
   val_ratio: 0.1
   test_ratio: 0.1
   
+  # Mini-batch size in *edges* (transactions) per forward pass
+  batch_size: 512
+
   # Cache configuration
   cache_enabled: true
   cache_dir: "./cache"
@@ -39,9 +42,9 @@ features:
     embedding_dim: 128
     
   # Dimensions
-  external_dim: 6
+  external_dim: 6       # TemporalGraphWithTraces produces 6-dim external features
   trace_dim: 128
-  total_edge_dim: 134
+  total_edge_dim: 134   # 6 external + 128 trace
 
 # Model Configuration
 model:
@@ -76,7 +79,7 @@ model:
 # Training Configuration
 training:
   device: "cuda"  # Options: cuda, cpu
-  batch_size: 32
+  batch_size: 512  # edges per batch (see data.batch_size)
   num_epochs: 50
   learning_rate: 0.001
   weight_decay: 1e-5

@@ -41,6 +41,8 @@ def compute_metrics(
         'precision': precision_score(labels, binary_preds, zero_division=0),
         'recall': recall_score(labels, binary_preds, zero_division=0),
         'f1': f1_score(labels, binary_preds, zero_division=0),
+        'macro_f1': f1_score(labels, binary_preds, average='macro', zero_division=0),
+        'weighted_f1': f1_score(labels, binary_preds, average='weighted', zero_division=0),
     }
     
     # AUC (requires soft predictions)

@@ -462,13 +462,16 @@ class GraphDataLoader:
         self,
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
-        test_ratio: float = 0.1
+        test_ratio: float = 0.1,
+        mode: str = 'edge'
     ) -> Tuple:
         """
         Create train/val/test DataLoaders.
         
         Args:
             train_ratio, val_ratio, test_ratio: Data split ratios
+            mode: 'edge'  → EdgeLevelDataset (batch_size edges per step, for non-GNN models)
+                  'graph' → GraphWindowDataset (1 full graph window per step, for GNN models)
         
         Returns:
             (train_loader, val_loader, test_loader)
@@ -586,30 +589,49 @@ class GraphDataLoader:
         val_graphs = [self.graphs[i] for i in val_indices]
         test_graphs = [self.graphs[i] for i in test_indices]
         
-        # Create DataLoaders
-        train_loader = torch.utils.data.DataLoader(
-            GraphDataset(train_graphs),
-            batch_size=self.batch_size,
-            shuffle=True,
-            collate_fn=collate_graph_batch,
-            num_workers=self.num_workers
-        )
-        
-        val_loader = torch.utils.data.DataLoader(
-            GraphDataset(val_graphs),
-            batch_size=self.batch_size,
-            shuffle=False,
-            collate_fn=collate_graph_batch,
-            num_workers=self.num_workers
-        )
-        
-        test_loader = torch.utils.data.DataLoader(
-            GraphDataset(test_graphs),
-            batch_size=self.batch_size,
-            shuffle=False,
-            collate_fn=collate_graph_batch,
-            num_workers=self.num_workers
-        )
+        if mode == 'graph':
+            # GNN models: 1 full temporal window per step (provides edge_index + node_features)
+            train_loader = torch.utils.data.DataLoader(
+                GraphWindowDataset(train_graphs),
+                batch_size=1,
+                shuffle=self.shuffle,
+                collate_fn=_collate_graph_window,
+                num_workers=self.num_workers
+            )
+            val_loader = torch.utils.data.DataLoader(
+                GraphWindowDataset(val_graphs),
+                batch_size=1,
+                shuffle=False,
+                collate_fn=_collate_graph_window,
+                num_workers=self.num_workers
+            )
+            test_loader = torch.utils.data.DataLoader(
+                GraphWindowDataset(test_graphs),
+                batch_size=1,
+                shuffle=False,
+                collate_fn=_collate_graph_window,
+                num_workers=self.num_workers
+            )
+        else:
+            # Non-GNN models: edge-level batching to avoid GPU OOM
+            train_loader = torch.utils.data.DataLoader(
+                EdgeLevelDataset(train_graphs),
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=self.num_workers
+            )
+            val_loader = torch.utils.data.DataLoader(
+                EdgeLevelDataset(val_graphs),
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers
+            )
+            test_loader = torch.utils.data.DataLoader(
+                EdgeLevelDataset(test_graphs),
+                batch_size=self.batch_size,
+                shuffle=False,
+                num_workers=self.num_workers
+            )
         
         return train_loader, val_loader, test_loader
 
@@ -633,6 +655,68 @@ class GraphDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         """Return complete graph data."""
         return self.graphs[idx]
+
+
+class EdgeLevelDataset(torch.utils.data.Dataset):
+    """
+    Edge-level dataset: each sample is one transaction edge.
+
+    Replaces graph-level batching so that `batch_size` controls how many
+    *edges* (transactions) are processed per forward pass, preventing OOM
+    when individual temporal graphs contain tens of thousands of edges.
+    """
+
+    MAX_SEQ_LEN = 256
+
+    def __init__(self, graphs: List[Dict[str, Any]]):
+        self.graphs = graphs
+        # Build flat index (graph_idx, edge_idx_in_graph) without copying data
+        self.index: List[Tuple[int, int]] = []
+        for g_idx, graph in enumerate(graphs):
+            for e_idx in range(graph['num_edges']):
+                self.index.append((g_idx, e_idx))
+
+    def __len__(self) -> int:
+        return len(self.index)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        g_idx, e_idx = self.index[idx]
+        graph = self.graphs[g_idx]
+        edge_feat = graph['edge_features'][e_idx]
+        label = int(graph['edge_labels'][e_idx])
+
+        max_seq_len = self.MAX_SEQ_LEN
+        ext_feat = np.asarray(edge_feat['external_features'], dtype=np.float32)
+        trace_feat = edge_feat['trace_features']
+        seq_len = trace_feat['sequence_length']
+        max_len = min(seq_len, max_seq_len)
+
+        call_type = np.zeros(max_seq_len, dtype=np.int64)
+        contract  = np.zeros(max_seq_len, dtype=np.int64)
+        func_id   = np.zeros(max_seq_len, dtype=np.int64)
+        depth     = np.zeros(max_seq_len, dtype=np.int64)
+        exec_prop = np.zeros((max_seq_len, 4), dtype=np.float32)
+        mask      = np.zeros(max_seq_len, dtype=bool)
+
+        if max_len > 0:
+            call_type[:max_len] = trace_feat['call_type_ids'][:max_len]
+            contract[:max_len]  = trace_feat['contract_ids'][:max_len]
+            func_id[:max_len]   = trace_feat['func_ids'][:max_len]
+            depth[:max_len]     = trace_feat['depth_ids'][:max_len]
+            exec_prop[:max_len] = trace_feat['exec_properties'][:max_len]
+            mask[:max_len]      = True
+
+        return {
+            'external_features':  torch.from_numpy(ext_feat),
+            'call_type_ids':      torch.from_numpy(call_type),
+            'contract_ids':       torch.from_numpy(contract),
+            'func_selector_ids':  torch.from_numpy(func_id),
+            'depths':             torch.from_numpy(depth),
+            'exec_properties':    torch.from_numpy(exec_prop),
+            'trace_mask':         torch.from_numpy(mask),
+            'labels':             torch.tensor(label, dtype=torch.long),
+            'num_edges':          torch.tensor(1, dtype=torch.long),
+        }
 
 
 def collate_graph_batch(
@@ -752,3 +836,93 @@ def collate_graph_batch(
         'labels': torch.cat(all_labels),  # (num_edges,)
         'num_edges': num_edges_total
     }
+
+
+# ============================================================================
+# GraphWindowDataset — for GNN-based models (provides edge_index + node_features)
+# ============================================================================
+
+class GraphWindowDataset(torch.utils.data.Dataset):
+    """
+    Graph-window-level dataset: each sample is a complete temporal graph window.
+
+    Used for GNN-based models (models 5-8) where message passing requires
+    the full graph topology (edge_index, node_features).  The GNNWindowTrainer
+    processes each window in a 2-stage loop:
+      1. mini-batch trace encoding (avoids OOM)
+      2. full-graph GNN → mini-batch edge classification
+    """
+
+    MAX_SEQ_LEN = 256
+
+    def __init__(self, graphs: List[Dict[str, Any]]):
+        self.graphs = graphs
+
+    def __len__(self) -> int:
+        return len(self.graphs)
+
+    def __getitem__(self, idx: int) -> Dict[str, Any]:
+        """Return the full graph window as pre-processed tensors."""
+        graph = self.graphs[idx]
+        num_edges = graph['num_edges']
+        max_seq_len = self.MAX_SEQ_LEN
+
+        # Pre-allocate edge-level tensors
+        external_features = np.zeros((num_edges, 6), dtype=np.float32)
+        call_type_ids     = np.zeros((num_edges, max_seq_len), dtype=np.int64)
+        contract_ids      = np.zeros((num_edges, max_seq_len), dtype=np.int64)
+        func_selector_ids = np.zeros((num_edges, max_seq_len), dtype=np.int64)
+        depths            = np.zeros((num_edges, max_seq_len), dtype=np.int64)
+        exec_properties   = np.zeros((num_edges, max_seq_len, 4), dtype=np.float32)
+        trace_masks       = np.zeros((num_edges, max_seq_len), dtype=bool)
+
+        for i, edge_feat in enumerate(graph['edge_features']):
+            ext = np.asarray(edge_feat['external_features'], dtype=np.float32)
+            external_features[i, :len(ext)] = ext[:6]  # clip to 6 dims
+
+            tf = edge_feat['trace_features']
+            seq_len = tf['sequence_length']
+            max_len = min(seq_len, max_seq_len)
+            if max_len > 0:
+                call_type_ids[i, :max_len]       = tf['call_type_ids'][:max_len]
+                contract_ids[i, :max_len]         = tf['contract_ids'][:max_len]
+                func_selector_ids[i, :max_len]    = tf['func_ids'][:max_len]
+                depths[i, :max_len]               = tf['depth_ids'][:max_len]
+                exec_properties[i, :max_len]      = tf['exec_properties'][:max_len]
+                trace_masks[i, :max_len]          = True
+
+        edge_index_np = graph['edge_index']          # (2, E) numpy
+        node_feats_np = graph.get('node_features')   # (N, D) numpy or None
+        if node_feats_np is None:
+            node_feats_np = np.zeros((graph['num_nodes'], 6), dtype=np.float32)
+
+        return {
+            # Edge-level features
+            'external_features':  torch.from_numpy(external_features),   # (E, 6)
+            'call_type_ids':      torch.from_numpy(call_type_ids),        # (E, 256)
+            'contract_ids':       torch.from_numpy(contract_ids),
+            'func_selector_ids':  torch.from_numpy(func_selector_ids),
+            'depths':             torch.from_numpy(depths),
+            'exec_properties':    torch.from_numpy(exec_properties),      # (E, 256, 4)
+            'trace_mask':         torch.from_numpy(trace_masks),          # (E, 256)
+            'labels':             torch.from_numpy(
+                                      np.asarray(graph['edge_labels'], dtype=np.int64)
+                                  ),                                       # (E,)
+            # Graph structure
+            'edge_index':         torch.from_numpy(
+                                      np.asarray(edge_index_np, dtype=np.int64)
+                                  ),                                       # (2, E)
+            'node_features':      torch.from_numpy(
+                                      np.asarray(node_feats_np, dtype=np.float32)
+                                  ),                                       # (N, D)
+            'num_edges':          torch.tensor(num_edges, dtype=torch.long),
+        }
+
+
+def _collate_graph_window(batch: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Collate function for GraphWindowDataset (batch_size=1).
+    Removes the outer list wrapper added by DataLoader.
+    """
+    assert len(batch) == 1, "GraphWindowDataset must be used with batch_size=1"
+    return batch[0]

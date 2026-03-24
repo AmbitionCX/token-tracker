@@ -240,7 +240,11 @@ class EdgeRepresentationAggregator(nn.Module):
         self.node_dim = node_dim
         self.edge_dim = edge_dim
         self.use_attention = use_attention
-        
+
+        # Always build concat fallback: training often has no neighbor_edges even when
+        # use_attention=True, so forward must be able to project [h_u; h_v; x_e] → edge_dim.
+        self.concat_proj = nn.Linear(2 * node_dim + edge_dim, edge_dim)
+
         if use_attention:
             self.attention = EdgeAttentionAggregator(
                 node_dim=node_dim,
@@ -249,9 +253,6 @@ class EdgeRepresentationAggregator(nn.Module):
                 num_heads=num_heads,
                 dropout=dropout
             )
-        else:
-            # Simple concatenation baseline (no attention)
-            self.concat_proj = nn.Linear(2 * node_dim + edge_dim, edge_dim)
     
     def forward(
         self,

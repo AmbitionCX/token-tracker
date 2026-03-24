@@ -124,7 +124,7 @@ class TransformerTraceEncoder(nn.Module):
             # Mask-aware pooling
             mask_expanded = mask.unsqueeze(-1).expand(transformed.size())  # (batch_size, seq_len, hidden_dim)
             sum_emb = (transformed * mask_expanded).sum(dim=1)  # (batch_size, hidden_dim)
-            sum_mask = mask.sum(dim=1, keepdim=True).unsqueeze(-1)  # (batch_size, 1, 1)
+            sum_mask = mask.sum(dim=1, keepdim=True)  # (batch_size, 1)
             output = sum_emb / (sum_mask + 1e-9)
         else:
             # Simple mean pooling over sequence
@@ -259,7 +259,7 @@ class PoolingTraceEncoder(nn.Module):
             masked_x = x * mask_expanded
             
             if self.pool_type == "mean":
-                output = masked_x.sum(dim=1) / (mask.sum(dim=1, keepdim=True).unsqueeze(-1) + 1e-9)
+                output = masked_x.sum(dim=1) / (mask.sum(dim=1, keepdim=True) + 1e-9)
             elif self.pool_type == "max":
                 masked_x[~mask_expanded] = float('-inf')
                 output = torch.max(masked_x, dim=1)[0]

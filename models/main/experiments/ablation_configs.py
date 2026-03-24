@@ -14,15 +14,18 @@ from typing import Dict, List, Optional, Any
 
 @dataclass
 class AblationConfig:
-    """Configuration for a single ablation experiment."""
+    """Configuration for a single ablation / baseline experiment."""
     
     name: str
     description: str
     use_trace: bool = True
     use_gnn: bool = True
     use_attention: bool = True
+    use_external: bool = True   # False → "Trace only" models (no external features)
     trace_encoder_type: str = "transformer"
     gnn_type: str = "gat"
+    # 'sklearn' → handled separately (xgboost_baseline.py)
+    model_backend: str = "pytorch"
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -32,8 +35,10 @@ class AblationConfig:
             'use_trace': self.use_trace,
             'use_gnn': self.use_gnn,
             'use_attention': self.use_attention,
+            'use_external': self.use_external,
             'trace_encoder_type': self.trace_encoder_type,
             'gnn_type': self.gnn_type,
+            'model_backend': self.model_backend,
         }
 
 
