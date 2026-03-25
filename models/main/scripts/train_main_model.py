@@ -82,7 +82,7 @@ def prepare_data(config: dict) -> tuple:
     graph_constructor = GraphConstructor(
         data_loader=db_loader,
         feature_extractor=feature_extractor,
-        temporal_window=int(data_cfg.get('temporal_window', 1000)),
+        temporal_window=int(data_cfg.get('window_size')),
         cache_dir=data_cfg.get('cache_dir', './cache')
     )
     
@@ -108,6 +108,11 @@ def prepare_data(config: dict) -> tuple:
         val_ratio=float(data_cfg['val_ratio']),
         test_ratio=1.0 - float(data_cfg['train_ratio']) - float(data_cfg['val_ratio']),
         train_edge_balance=bool(data_cfg.get('train_edge_balance', False)),
+        train_negative_sample=bool(data_cfg.get('train_negative_sample', False)),
+        train_negative_keep_ratio=float(data_cfg.get('train_negative_keep_ratio', 0.5)),
+        negative_sample_seed=int(
+            data_cfg.get('negative_sample_seed', config.get('random_seed', 42))
+        ),
     )
     
     print(f"Created DataLoaders:")
@@ -277,6 +282,12 @@ def train_model(config: dict) -> None:
             f"Recall={full_test['recall_at_best_threshold']:.4f}  "
             f"F1={full_test['f1_at_best_threshold']:.4f}"
         )
+        print("  Top-K (rank by P(class=1)):")
+        for k in (10, 50, 100):
+            print(
+                f"    Precision@{k}={full_test[f'precision_at_{k}']:.4f}  "
+                f"Recall@{k}={full_test[f'recall_at_{k}']:.4f}"
+            )
 
         report_dir = Path(training_cfg['checkpoint']['save_dir'])
         def _jsonable_scalar(v):

@@ -11,7 +11,7 @@ data:
   chunk_size: 5000
   
   # Temporal window configuration
-  window_size: 5000  # Δ = window_size blocks 
+  window_size: 1000  # Δ = window_size blocks 
 
   # Data split (time-series split to avoid leakage)
   train_ratio: 0.8
@@ -27,6 +27,11 @@ data:
 
   # Train loader: oversample positives vs negatives at edge level (inverse class frequency)
   train_edge_balance: true
+
+  # Train loader: negative subsampling — keep all positives, randomly keep a fraction of negatives
+  train_negative_sample: false
+  train_negative_keep_ratio: 0.1   # (0, 1] fraction of negative edges retained; 1.0 = keep all
+  negative_sample_seed: 42           # reproducible subsample (also uses top-level random_seed if you prefer wiring)
 
 # Feature Engineering
 features:
@@ -88,7 +93,7 @@ training:
   weight_decay: 1e-5
   
   # Loss function (imbalanced positives vs negatives)
-  loss_fn: "weighted_crossentropy"  # crossentropy | weighted_crossentropy | focal
+  loss_fn: "focal"  # crossentropy | weighted_crossentropy | focal
   positive_weight: 25.0  # CE / focal class weight for class 1 (suspicious); raise if positives are still missed (try 50–100)
   focal_gamma: 2.0     # used when loss_fn is focal (focus on hard examples)
   label_smoothing: 0.0     # optional 0.05 to stabilize; keep 0 for rare-positive focus

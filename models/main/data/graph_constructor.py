@@ -472,17 +472,26 @@ class GraphConstructor:
         return graphs
 
 
-def _edge_sample_weights_balanced(train_graphs: List[Dict[str, Any]]) -> torch.DoubleTensor:
+def _edge_sample_weights_balanced(
+    train_graphs: List[Dict[str, Any]],
+    edge_index: Optional[List[Tuple[int, int]]] = None,
+) -> torch.DoubleTensor:
     """
     One weight per edge (same order as EdgeLevelDataset flat index) for
     class-balanced sampling: P(edge) ∝ 1 / count(class).
+
+    If ``edge_index`` is set (e.g. after negative subsampling), weights follow that order.
     """
     labels: List[int] = []
-    for g in train_graphs:
-        el = g.get("edge_labels", [])
-        ne = int(g.get("num_edges", len(el)))
-        for i in range(ne):
-            labels.append(int(el[i]))
+    if edge_index is None:
+        for g in train_graphs:
+            el = g.get("edge_labels", [])
+            ne = int(g.get("num_edges", len(el)))
+            for i in range(ne):
+                labels.append(int(el[i]))
+    else:
+        for g_idx, e_idx in edge_index:
+            labels.append(int(train_graphs[g_idx]["edge_labels"][e_idx]))
     if not labels:
         return torch.DoubleTensor([])
     arr = np.array(labels, dtype=np.int64)
@@ -491,6 +500,51 @@ def _edge_sample_weights_balanced(train_graphs: List[Dict[str, Any]]) -> torch.D
     n1 = max(int((arr == 1).sum()), 1)
     w = np.where(arr == 0, n / (2 * n0), n / (2 * n1))
     return torch.DoubleTensor(w)
+
+
+def _build_train_edge_index_neg_subsample(
+    train_graphs: List[Dict[str, Any]],
+    negative_keep_ratio: float,
+    rng: np.random.Generator,
+) -> List[Tuple[int, int]]:
+    """
+    Keep all positive edges; randomly retain a fraction of negative edges.
+
+    Args:
+        train_graphs: Training split graphs (local indices 0..G-1).
+        negative_keep_ratio: Fraction of negative edges to keep in ``(0, 1]``.
+    """
+    pos: List[Tuple[int, int]] = []
+    neg: List[Tuple[int, int]] = []
+    for g_idx, graph in enumerate(train_graphs):
+        ne = int(graph.get("num_edges", len(graph.get("edge_labels", []))))
+        for e_idx in range(ne):
+            lab = int(graph["edge_labels"][e_idx])
+            t = (g_idx, e_idx)
+            if lab == 1:
+                pos.append(t)
+            else:
+                neg.append(t)
+
+    if not neg or negative_keep_ratio >= 1.0:
+        combined = pos + neg
+        rng.shuffle(combined)
+        return combined
+
+    ratio = float(negative_keep_ratio)
+    if ratio <= 0:
+        raise ValueError(
+            "train_negative_keep_ratio must be > 0 when train_negative_sample is true."
+        )
+    n_keep = int(round(len(neg) * ratio))
+    n_keep = max(0, min(n_keep, len(neg)))
+    if n_keep == 0 and len(neg) > 0:
+        n_keep = 1  # keep at least one negative if any existed
+    idx = rng.choice(len(neg), size=n_keep, replace=False)
+    neg_kept = [neg[i] for i in idx]
+    combined = pos + neg_kept
+    rng.shuffle(combined)
+    return combined
 
 
 class GraphDataLoader:
@@ -522,6 +576,9 @@ class GraphDataLoader:
         test_ratio: float = 0.1,
         mode: str = 'edge',
         train_edge_balance: bool = False,
+        train_negative_sample: bool = False,
+        train_negative_keep_ratio: float = 0.5,
+        negative_sample_seed: int = 42,
     ) -> Tuple:
         """
         Create train/val/test DataLoaders.
@@ -532,6 +589,11 @@ class GraphDataLoader:
                   'graph' → GraphWindowDataset (1 full graph window per step, for GNN models)
             train_edge_balance: If True (edge mode only), train loader uses ``WeightedRandomSampler``
                 so positive edges are drawn as often as negatives in expectation (inverse-frequency).
+            train_negative_sample: If True (edge mode only), randomly keep only a fraction of negative
+                training edges (all positives kept); reduces majority-class overload.
+            train_negative_keep_ratio: Fraction of negative edges to retain in ``(0, 1]`` when
+                ``train_negative_sample`` is True.
+            negative_sample_seed: RNG seed for subsampling negatives.
         
         Returns:
             (train_loader, val_loader, test_loader)
@@ -674,9 +736,39 @@ class GraphDataLoader:
             )
         else:
             # Non-GNN models: edge-level batching to avoid GPU OOM
-            train_ds = EdgeLevelDataset(train_graphs)
+            train_edge_index: Optional[List[Tuple[int, int]]] = None
+            if train_negative_sample:
+                rk = float(train_negative_keep_ratio)
+                if rk <= 0.0 or rk > 1.0:
+                    raise ValueError(
+                        "train_negative_keep_ratio must be in (0, 1] when train_negative_sample is true."
+                    )
+                rng = np.random.default_rng(int(negative_sample_seed))
+                train_edge_index = _build_train_edge_index_neg_subsample(
+                    train_graphs,
+                    float(train_negative_keep_ratio),
+                    rng,
+                )
+                n_neg_full = sum(
+                    1
+                    for g in train_graphs
+                    for i in range(int(g.get("num_edges", len(g.get("edge_labels", [])))))
+                    if int(g["edge_labels"][i]) == 0
+                )
+                n_pos_kept = sum(
+                    1
+                    for gi, ei in train_edge_index
+                    if int(train_graphs[gi]["edge_labels"][ei]) == 1
+                )
+                n_neg_kept = len(train_edge_index) - n_pos_kept
+                print(
+                    f"[train] Negative subsample: kept {n_neg_kept}/{n_neg_full} negatives, "
+                    f"{n_pos_kept} positives (keep_ratio={train_negative_keep_ratio}, "
+                    f"seed={negative_sample_seed})"
+                )
+            train_ds = EdgeLevelDataset(train_graphs, index=train_edge_index)
             if train_edge_balance:
-                sample_w = _edge_sample_weights_balanced(train_graphs)
+                sample_w = _edge_sample_weights_balanced(train_graphs, edge_index=train_edge_index)
                 if len(sample_w) != len(train_ds):
                     raise RuntimeError(
                         "train_edge_balance: weight count does not match EdgeLevelDataset length."
@@ -746,13 +838,20 @@ class EdgeLevelDataset(torch.utils.data.Dataset):
 
     MAX_SEQ_LEN = 256
 
-    def __init__(self, graphs: List[Dict[str, Any]]):
+    def __init__(
+        self,
+        graphs: List[Dict[str, Any]],
+        index: Optional[List[Tuple[int, int]]] = None,
+    ):
         self.graphs = graphs
-        # Build flat index (graph_idx, edge_idx_in_graph) without copying data
-        self.index: List[Tuple[int, int]] = []
-        for g_idx, graph in enumerate(graphs):
-            for e_idx in range(graph['num_edges']):
-                self.index.append((g_idx, e_idx))
+        if index is not None:
+            self.index = list(index)
+        else:
+            # Build flat index (graph_idx, edge_idx_in_graph) without copying data
+            self.index = []
+            for g_idx, graph in enumerate(graphs):
+                for e_idx in range(graph["num_edges"]):
+                    self.index.append((g_idx, e_idx))
 
     def __len__(self) -> int:
         return len(self.index)

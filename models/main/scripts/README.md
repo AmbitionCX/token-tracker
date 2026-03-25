@@ -19,7 +19,24 @@ Features:
 - Evaluates on validation and test sets
 - Saves best checkpoint
 
-### 2. `train_baselines.py` (TO IMPLEMENT)
+### 2. `run_gnn_baselines.py`
+**Train three GNN baselines (external-only, + mean trace, + Transformer) and print test metrics.**
+
+```bash
+cd models/main
+python scripts/run_gnn_baselines.py
+```
+
+Outputs:
+- Checkpoints under `checkpoints/gnn_baselines/<experiment>/`
+- `checkpoints/gnn_baselines/gnn_baselines_metrics.csv` (Accuracy, PR-AUC, Precision, Recall, F1, AUC-ROC at threshold 0.5)
+
+Source models:
+- `baselines/gnn_model.py` — GNN (External only)
+- `baselines/gnn_mean_trace_model.py` — GNN + Mean Trace (pooling encoder)
+- `baselines/gnn_transformer_model.py` — GNN + Transformer
+
+### 3. `train_baselines.py` (TO IMPLEMENT)
 **Train all baseline models.**
 
 ```bash
@@ -35,7 +52,7 @@ Baselines:
 - LSTM (sequence-only)
 - Transformer (sequence-only)
 
-### 3. `run_ablations.py` (TO IMPLEMENT)
+### 4. `run_ablations.py` (TO IMPLEMENT)
 **Run all 6 ablation experiments.**
 
 ```bash
@@ -50,7 +67,7 @@ Experiments:
 5. **LSTM Encoder**: LSTM instead of Transformer
 6. **Pooling Encoder**: Pooling instead of Transformer
 
-### 4. `generate_report.py` (TO IMPLEMENT)
+### 5. `generate_report.py` (TO IMPLEMENT)
 **Generate comprehensive results report.**
 
 ```bash

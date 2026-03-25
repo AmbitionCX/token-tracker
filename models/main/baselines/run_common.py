@@ -69,6 +69,12 @@ def prepare_dataloaders(config: dict, mode: str = "edge") -> Tuple[Any, Any, Any
         val_ratio=float(data_cfg["val_ratio"]),
         test_ratio=1.0 - float(data_cfg["train_ratio"]) - float(data_cfg["val_ratio"]),
         mode=mode,
+        train_edge_balance=bool(data_cfg.get("train_edge_balance", False)),
+        train_negative_sample=bool(data_cfg.get("train_negative_sample", False)),
+        train_negative_keep_ratio=float(data_cfg.get("train_negative_keep_ratio", 0.5)),
+        negative_sample_seed=int(
+            data_cfg.get("negative_sample_seed", config.get("random_seed", 42))
+        ),
     )
 
 

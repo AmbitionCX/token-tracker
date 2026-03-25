@@ -13,7 +13,40 @@ from sklearn.metrics import (
     average_precision_score,
     precision_recall_curve,
 )
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
+
+
+def topk_precision_recall_metrics(
+    y_true: np.ndarray,
+    y_score: np.ndarray,
+    ks: Tuple[int, ...] = (10, 50, 100),
+) -> Dict[str, float]:
+    """
+    Ranking-based metrics: sort by ``y_score`` descending, take top ``k`` samples.
+
+    - **Precision@K**: (# positives in top-K) / K  (uses K_eff = min(K, n))
+    - **Recall@K**: (# positives in top-K) / (total positives in dataset)
+    """
+    y_true = np.asarray(y_true).ravel()
+    y_score = np.asarray(y_score).ravel()
+    n = y_true.size
+    out: Dict[str, float] = {}
+    if n == 0:
+        for k in ks:
+            out[f"precision_at_{k}"] = 0.0
+            out[f"recall_at_{k}"] = 0.0
+        return out
+
+    order = np.argsort(-y_score)
+    total_pos = int(y_true.sum())
+
+    for k in ks:
+        k_eff = min(int(k), n)
+        top_idx = order[:k_eff]
+        tp_k = int(y_true[top_idx].sum())
+        out[f"precision_at_{k}"] = float(tp_k / k_eff) if k_eff > 0 else 0.0
+        out[f"recall_at_{k}"] = float(tp_k / total_pos) if total_pos > 0 else 0.0
+    return out
 
 
 def compute_metrics(
@@ -137,6 +170,7 @@ def compute_binary_test_metrics(
     y_score: np.ndarray,
     threshold_fixed: float = 0.5,
     eps: float = 1e-8,
+    topk_ks: Tuple[int, ...] = (10, 50, 100),
 ) -> Dict[str, float]:
     """
     Full test-set metrics: threshold-free AUCs, fixed-threshold, and PR-curve best-F1 threshold.
@@ -190,6 +224,8 @@ def compute_binary_test_metrics(
     out["fp_best"] = float(fp_b)
     out["fn_best"] = float(fn_b)
     out["tp_best"] = float(tp_b)
+
+    out.update(topk_precision_recall_metrics(y_true, y_score, ks=topk_ks))
 
     return out
 
@@ -258,6 +294,16 @@ def render_training_report_txt(
         lines.append(f"  Recall:    {_fmt_metric(score_metrics['recall_at_best_threshold'])}\n")
         lines.append(f"  F1:        {_fmt_metric(score_metrics['f1_at_best_threshold'])}\n")
         lines.append("\n")
+        if "precision_at_10" in score_metrics:
+            lines.append("Top-K (rank by P(class=1), descending)\n")
+            for k in (10, 50, 100):
+                pk, rk = f"precision_at_{k}", f"recall_at_{k}"
+                if pk in score_metrics and rk in score_metrics:
+                    lines.append(
+                        f"  Precision@{k}: {_fmt_metric(score_metrics[pk])}  "
+                        f"Recall@{k}: {_fmt_metric(score_metrics[rk])}\n"
+                    )
+            lines.append("\n")
     else:
         lines.append(f"Accuracy:  {accuracy_score(y_true_final, y_pred_final):.4f}\n")
         lines.append(f"Precision: {precision_score(y_true_final, y_pred_final, zero_division=0):.4f}\n")
@@ -296,5 +342,6 @@ __all__ = [
     "compute_metrics",
     "best_f1_threshold_from_pr_curve",
     "compute_binary_test_metrics",
+    "topk_precision_recall_metrics",
     "render_training_report_txt",
 ]

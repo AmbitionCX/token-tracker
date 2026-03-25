@@ -1,6 +1,5 @@
 """
 Baseline models for comparison.
-
 Includes:
 - Traditional ML: LogisticRegression, RandomForest, XGBoost
 - Graph-only: GCN, GraphSAGE, GAT (no sequence encoding)
@@ -11,8 +10,11 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
 import xgboost as xgb
 
-# Placeholder for baseline implementations
-# These will wrap traditional sklearn/xgboost models with unified interface
+from .xgboost_model import XGBoostBaseline
+from .mlp_model import MLPBaseline
+from .lstm_model import LSTMBaseline
+from .transformer_model import TransformerBaseline
+
 
 class TraditionalBaselines:
     """Traditional ML models on hand-crafted features (external only)."""
@@ -37,4 +39,8 @@ class TraditionalBaselines:
 
 __all__ = [
     'TraditionalBaselines',
+    'XGBoostBaseline',
+    'MLPBaseline',
+    'LSTMBaseline',
+    'TransformerBaseline',
 ]
