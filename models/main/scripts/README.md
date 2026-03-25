@@ -97,7 +97,7 @@ python scripts/train_main_model.py
 ```bash
 ls checkpoints/  # View saved models
 tail -f logs/train.log  # Monitor training
-tensorboard --logdir logs/runs/  # View metrics
+tensorboard --logdir logs  # View metrics
 ```
 
 ### Inspect specific model

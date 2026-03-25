@@ -25,6 +25,7 @@ from collections import defaultdict
 import pickle
 from tqdm import tqdm
 import networkx as nx
+from torch.utils.data import WeightedRandomSampler
 
 from .data_loader import TransactionDataLoader
 from core import EdgeFeatureExtractor
@@ -471,6 +472,27 @@ class GraphConstructor:
         return graphs
 
 
+def _edge_sample_weights_balanced(train_graphs: List[Dict[str, Any]]) -> torch.DoubleTensor:
+    """
+    One weight per edge (same order as EdgeLevelDataset flat index) for
+    class-balanced sampling: P(edge) ∝ 1 / count(class).
+    """
+    labels: List[int] = []
+    for g in train_graphs:
+        el = g.get("edge_labels", [])
+        ne = int(g.get("num_edges", len(el)))
+        for i in range(ne):
+            labels.append(int(el[i]))
+    if not labels:
+        return torch.DoubleTensor([])
+    arr = np.array(labels, dtype=np.int64)
+    n = len(arr)
+    n0 = max(int((arr == 0).sum()), 1)
+    n1 = max(int((arr == 1).sum()), 1)
+    w = np.where(arr == 0, n / (2 * n0), n / (2 * n1))
+    return torch.DoubleTensor(w)
+
+
 class GraphDataLoader:
     """Create PyTorch DataLoaders from temporal graphs."""
     
@@ -498,7 +520,8 @@ class GraphDataLoader:
         train_ratio: float = 0.8,
         val_ratio: float = 0.1,
         test_ratio: float = 0.1,
-        mode: str = 'edge'
+        mode: str = 'edge',
+        train_edge_balance: bool = False,
     ) -> Tuple:
         """
         Create train/val/test DataLoaders.
@@ -507,6 +530,8 @@ class GraphDataLoader:
             train_ratio, val_ratio, test_ratio: Data split ratios
             mode: 'edge'  → EdgeLevelDataset (batch_size edges per step, for non-GNN models)
                   'graph' → GraphWindowDataset (1 full graph window per step, for GNN models)
+            train_edge_balance: If True (edge mode only), train loader uses ``WeightedRandomSampler``
+                so positive edges are drawn as often as negatives in expectation (inverse-frequency).
         
         Returns:
             (train_loader, val_loader, test_loader)
@@ -649,12 +674,30 @@ class GraphDataLoader:
             )
         else:
             # Non-GNN models: edge-level batching to avoid GPU OOM
-            train_loader = torch.utils.data.DataLoader(
-                EdgeLevelDataset(train_graphs),
-                batch_size=self.batch_size,
-                shuffle=True,
-                num_workers=self.num_workers
-            )
+            train_ds = EdgeLevelDataset(train_graphs)
+            if train_edge_balance:
+                sample_w = _edge_sample_weights_balanced(train_graphs)
+                if len(sample_w) != len(train_ds):
+                    raise RuntimeError(
+                        "train_edge_balance: weight count does not match EdgeLevelDataset length."
+                    )
+                train_sampler = WeightedRandomSampler(
+                    sample_w, num_samples=len(train_ds), replacement=True
+                )
+                train_loader = torch.utils.data.DataLoader(
+                    train_ds,
+                    batch_size=self.batch_size,
+                    sampler=train_sampler,
+                    shuffle=False,
+                    num_workers=self.num_workers,
+                )
+            else:
+                train_loader = torch.utils.data.DataLoader(
+                    train_ds,
+                    batch_size=self.batch_size,
+                    shuffle=self.shuffle,
+                    num_workers=self.num_workers,
+                )
             val_loader = torch.utils.data.DataLoader(
                 EdgeLevelDataset(val_graphs),
                 batch_size=self.batch_size,

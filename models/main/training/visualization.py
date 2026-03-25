@@ -20,6 +20,8 @@ from sklearn.metrics import (
 )
 import json
 
+from .metrics import compute_binary_test_metrics, render_training_report_txt
+
 
 class TrainingVisualizer:
     """Generate visualizations for training results."""
@@ -409,86 +411,35 @@ class TrainingVisualizer:
         y_true_final: np.ndarray,
         y_pred_final: np.ndarray,
         y_scores_final: Optional[np.ndarray] = None,
-        save_path: Optional[str] = None
+        save_path: Optional[str] = None,
+        score_metrics: Optional[Dict[str, float]] = None,
     ) -> str:
         """
         Generate a text summary report.
-        
-        Args:
-            history: Training history
-            y_true_final: Test labels
-            y_pred_final: Test predictions
-            y_scores_final: Test scores
-            save_path: Path to save report
-        
-        Returns:
-            Path where report was saved
+
+        Pass ``score_metrics`` (e.g. output of ``compute_binary_test_metrics``) from the
+        training script so the file always matches the printed test metrics (PR-AUC, best
+        threshold, etc.). If omitted, metrics are recomputed from ``y_scores_final`` when
+        non-empty.
         """
         if save_path is None:
             save_path = self.output_dir / "training_report.txt"
         else:
             save_path = Path(save_path)
-        
-        from sklearn.metrics import (
-            accuracy_score, precision_score, recall_score, f1_score,
-            roc_auc_score, confusion_matrix
+
+        resolved: Optional[Dict[str, float]] = score_metrics
+        if resolved is None:
+            ys = None if y_scores_final is None else np.asarray(y_scores_final).ravel()
+            if ys is not None and ys.size > 0:
+                resolved = compute_binary_test_metrics(
+                    y_true_final, ys, threshold_fixed=0.5
+                )
+
+        body = render_training_report_txt(
+            history, y_true_final, y_pred_final, score_metrics=resolved
         )
-        
-        # Compute metrics
-        accuracy = accuracy_score(y_true_final, y_pred_final)
-        precision = precision_score(y_true_final, y_pred_final, zero_division=0)
-        recall = recall_score(y_true_final, y_pred_final, zero_division=0)
-        f1 = f1_score(y_true_final, y_pred_final, zero_division=0)
-        
-        auc_score = None
-        if y_scores_final is not None:
-            auc_score = roc_auc_score(y_true_final, y_scores_final)
-        
-        cm = confusion_matrix(y_true_final, y_pred_final)
-        tn, fp, fn, tp = cm.ravel()
-        specificity = tn / (tn + fp) if (tn + fp) > 0 else 0
-        
-        # Write report
-        with open(save_path, 'w') as f:
-            f.write("=" * 60 + "\n")
-            f.write("Training and Evaluation Report\n")
-            f.write("=" * 60 + "\n\n")
-            
-            f.write("TRAINING HISTORY\n")
-            f.write("-" * 60 + "\n")
-            f.write(f"Number of epochs: {len(history.get('train_loss', []))}\n")
-            if 'train_loss' in history:
-                f.write(f"Final train loss: {history['train_loss'][-1]:.6f}\n")
-            if 'val_loss' in history:
-                f.write(f"Final val loss: {history['val_loss'][-1]:.6f}\n")
-                f.write(f"Best val loss: {min(history['val_loss']):.6f}\n")
-            f.write("\n")
-            
-            f.write("TEST SET RESULTS\n")
-            f.write("-" * 60 + "\n")
-            f.write(f"Accuracy:  {accuracy:.4f}\n")
-            f.write(f"Precision: {precision:.4f}\n")
-            f.write(f"Recall:    {recall:.4f}\n")
-            f.write(f"F1 Score:  {f1:.4f}\n")
-            if auc_score is not None:
-                f.write(f"AUC-ROC:   {auc_score:.4f}\n")
-            f.write(f"Specificity: {specificity:.4f}\n")
-            f.write("\n")
-            
-            f.write("CONFUSION MATRIX\n")
-            f.write("-" * 60 + "\n")
-            f.write(f"True Negatives:  {tn}\n")
-            f.write(f"False Positives: {fp}\n")
-            f.write(f"False Negatives: {fn}\n")
-            f.write(f"True Positives:  {tp}\n")
-            f.write("\n")
-            
-            f.write("CLASS DISTRIBUTION (TEST SET)\n")
-            f.write("-" * 60 + "\n")
-            unique, counts = np.unique(y_true_final, return_counts=True)
-            for label, count in zip(unique, counts):
-                percentage = 100 * count / len(y_true_final)
-                f.write(f"Class {label}: {int(count)} ({percentage:.2f}%)\n")
-        
+        with open(save_path, "w", encoding="utf-8") as f:
+            f.write(body)
+
         print(f"✓ Summary report saved to {save_path}")
         return str(save_path)

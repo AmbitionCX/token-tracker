@@ -11,6 +11,7 @@ Example script showing how to:
 
 import sys
 import os
+import json
 import torch
 import numpy as np
 from pathlib import Path
@@ -29,7 +30,13 @@ from data import (
     GraphConstructor,
     GraphDataLoader
 )
-from training import Trainer, compute_metrics, TrainingVisualizer
+from training import (
+    Trainer,
+    compute_metrics,
+    compute_binary_test_metrics,
+    TrainingVisualizer,
+    build_train_loss,
+)
 import yaml
 
 
@@ -99,7 +106,8 @@ def prepare_data(config: dict) -> tuple:
     train_loader, val_loader, test_loader = graph_loader.create_dataloaders(
         train_ratio=float(data_cfg['train_ratio']),
         val_ratio=float(data_cfg['val_ratio']),
-        test_ratio=1.0 - float(data_cfg['train_ratio']) - float(data_cfg['val_ratio'])
+        test_ratio=1.0 - float(data_cfg['train_ratio']) - float(data_cfg['val_ratio']),
+        train_edge_balance=bool(data_cfg.get('train_edge_balance', False)),
     )
     
     print(f"Created DataLoaders:")
@@ -152,6 +160,20 @@ def train_model(config: dict) -> None:
     print(f"Model created: {model.__class__.__name__}")
     print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
     
+    # Loss: use class weights so rare positives are not ignored (see config training.loss_fn / positive_weight)
+    loss_fn = build_train_loss(
+        loss_name=str(training_cfg.get("loss_fn", "weighted_crossentropy")),
+        device=device,
+        positive_weight=float(training_cfg.get("positive_weight", 10.0)),
+        label_smoothing=float(training_cfg.get("label_smoothing", 0.0)),
+        focal_gamma=float(training_cfg.get("focal_gamma", 2.0)),
+    )
+    print(
+        f"Loss: {training_cfg.get('loss_fn', 'weighted_crossentropy')} "
+        f"(positive_weight={training_cfg.get('positive_weight', 10.0)}, "
+        f"focal_gamma={training_cfg.get('focal_gamma', 2.0)})"
+    )
+    
     # Create trainer
     trainer = Trainer(
         model=model,
@@ -165,14 +187,18 @@ def train_model(config: dict) -> None:
     
     # Train
     print("Starting training...")
+    metric_for_best = str(training_cfg.get("early_stopping_metric", "macro_f1"))
     history = trainer.fit(
         train_loader=train_loader,
         val_loader=val_loader,
         num_epochs=int(training_cfg['num_epochs']),
         learning_rate=float(training_cfg['learning_rate']),
         weight_decay=float(training_cfg['weight_decay']),
+        loss_fn=loss_fn,
+        metric_fn=lambda preds, labels: compute_metrics(preds, labels),
         patience=int(training_cfg['early_stopping']['patience']),
-        save_best=training_cfg['checkpoint']['keep_best']
+        save_best=training_cfg['checkpoint']['keep_best'],
+        metric_for_best=metric_for_best,
     )
     
     # Save final model
@@ -188,13 +214,10 @@ def train_model(config: dict) -> None:
         # Evaluate
         test_metrics = trainer.validate(
             test_loader,
-            loss_fn=torch.nn.CrossEntropyLoss(),
+            loss_fn=loss_fn,
             metric_fn=lambda preds, labels: compute_metrics(preds, labels)
         )
-        
-        print("\nTest Results:")
-        for metric_name, metric_value in test_metrics.items():
-            print(f"  {metric_name}: {metric_value:.4f}")
+        print(f"\nTest weighted loss: {test_metrics['loss']:.6f}")
         
         # Collect all predictions for visualization
         print("\nCollecting predictions for visualization...")
@@ -237,6 +260,46 @@ def train_model(config: dict) -> None:
         y_test_true = np.concatenate(all_labels)
         y_test_pred = np.concatenate(all_preds)
         y_test_scores = np.concatenate(all_scores)
+
+        full_test = compute_binary_test_metrics(y_test_true, y_test_scores, threshold_fixed=0.5)
+        print("\nTest set (scores + thresholds):")
+        print(f"  ROC-AUC: {full_test['roc_auc']:.4f}  |  PR-AUC: {full_test['pr_auc']:.4f}")
+        print("  At threshold 0.5 (argmax):")
+        print(
+            f"    Precision={full_test['precision_fixed']:.4f}  "
+            f"Recall={full_test['recall_fixed']:.4f}  F1={full_test['f1_fixed']:.4f}"
+        )
+        print(
+            f"  At best F1 on PR curve (threshold={full_test['best_threshold_pr_f1']:.6f}):"
+        )
+        print(
+            f"    Precision={full_test['precision_at_best_threshold']:.4f}  "
+            f"Recall={full_test['recall_at_best_threshold']:.4f}  "
+            f"F1={full_test['f1_at_best_threshold']:.4f}"
+        )
+
+        report_dir = Path(training_cfg['checkpoint']['save_dir'])
+        def _jsonable_scalar(v):
+            if isinstance(v, (float, np.floating)):
+                x = float(v)
+                return None if np.isnan(x) or np.isinf(x) else x
+            if isinstance(v, (int, np.integer)):
+                return int(v)
+            return v
+
+        test_metrics_path = report_dir / 'test_metrics.json'
+        with open(test_metrics_path, 'w', encoding='utf-8') as jf:
+            json.dump(
+                {
+                    'y_true': y_test_true.tolist(),
+                    'y_pred': y_test_pred.tolist(),
+                    'y_scores': y_test_scores.tolist(),
+                    'metrics': {k: _jsonable_scalar(v) for k, v in full_test.items()},
+                },
+                jf,
+                indent=2,
+            )
+        print(f"\nSaved test predictions + metrics to {test_metrics_path}")
         
         # Generate visualizations
         print("\nGenerating visualizations...")
@@ -254,7 +317,8 @@ def train_model(config: dict) -> None:
             history=history,
             y_true_final=y_test_true,
             y_pred_final=y_test_pred,
-            y_scores_final=y_test_scores
+            y_scores_final=y_test_scores,
+            score_metrics=full_test,
         )
         
         print("\n" + "=" * 60)

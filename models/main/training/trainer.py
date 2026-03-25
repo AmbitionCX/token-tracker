@@ -241,7 +241,8 @@ class Trainer:
         metric_fn: Optional[Callable] = None,
         patience: int = 10,
         save_best: bool = True,
-        scheduler: Optional[str] = None
+        scheduler: Optional[str] = None,
+        metric_for_best: str = "macro_f1",
     ) -> Dict[str, List[float]]:
         """
         Full training loop.
@@ -257,6 +258,8 @@ class Trainer:
             patience: Early stopping patience
             save_best: Save best model
             scheduler: Learning rate scheduler type
+            metric_for_best: Validation key used to pick best checkpoint (default ``macro_f1`` for
+                imbalanced classes). Use ``loss`` to minimize validation loss instead.
         
         Returns:
             Training history
@@ -276,8 +279,10 @@ class Trainer:
         # Training history
         history = {'train_loss': [], 'val_loss': [], 'val_metrics': []}
         
-        # Early stopping
+        # Early stopping — reset best score for this run
         patience_counter = 0
+        self.best_metric = float("inf") if metric_for_best == "loss" else float("-inf")
+        self.best_epoch = 0
         
         for epoch in range(num_epochs):
             self.epoch = epoch
@@ -297,17 +302,29 @@ class Trainer:
             if self.writer:
                 self.writer.add_scalar('val/loss', val_metrics['loss'], epoch)
                 for k, v in val_metrics.items():
-                    if k != 'loss':
+                    if k != 'loss' and isinstance(v, (int, float)):
                         self.writer.add_scalar(f'val/{k}', v, epoch)
             
             # Learning rate scheduler step
             if scheduler_obj:
                 scheduler_obj.step()
             
-            # Early stopping and checkpointing
-            metric_value = val_metrics.get('f1', val_metrics['loss'])
+            # Early stopping and checkpointing (macro_f1 default: better for imbalance than accuracy)
+            key = metric_for_best
+            if key not in val_metrics:
+                key = (
+                    "macro_f1"
+                    if "macro_f1" in val_metrics
+                    else ("f1" if "f1" in val_metrics else "loss")
+                )
+            metric_value = val_metrics[key]
+            minimize = key == "loss"
+            if minimize:
+                is_better = metric_value < self.best_metric
+            else:
+                is_better = metric_value > self.best_metric
             
-            if metric_value > self.best_metric:
+            if is_better:
                 self.best_metric = metric_value
                 self.best_epoch = epoch
                 patience_counter = 0

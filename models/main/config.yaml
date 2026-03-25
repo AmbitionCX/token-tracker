@@ -11,8 +11,8 @@ data:
   chunk_size: 5000
   
   # Temporal window configuration
-  window_size: 1000  # Δ = 1000 blocks (~2.5 hours)
-  
+  window_size: 5000  # Δ = window_size blocks 
+
   # Data split (time-series split to avoid leakage)
   train_ratio: 0.8
   val_ratio: 0.1
@@ -24,6 +24,9 @@ data:
   # Cache configuration
   cache_enabled: true
   cache_dir: "./cache"
+
+  # Train loader: oversample positives vs negatives at edge level (inverse class frequency)
+  train_edge_balance: true
 
 # Feature Engineering
 features:
@@ -84,9 +87,14 @@ training:
   learning_rate: 0.001
   weight_decay: 1e-5
   
-  # Loss function
-  loss_fn: "weighted_crossentropy"  # Handle imbalanced data
-  positive_weight: 10.0  # Weight for suspicious class
+  # Loss function (imbalanced positives vs negatives)
+  loss_fn: "weighted_crossentropy"  # crossentropy | weighted_crossentropy | focal
+  positive_weight: 25.0  # CE / focal class weight for class 1 (suspicious); raise if positives are still missed (try 50–100)
+  focal_gamma: 2.0     # used when loss_fn is focal (focus on hard examples)
+  label_smoothing: 0.0     # optional 0.05 to stabilize; keep 0 for rare-positive focus
+  
+  # Best checkpoint: macro_f1 balances both classes on imbalanced data (avoid "all negative" optimum)
+  early_stopping_metric: "macro_f1"  # or "f1" (positive F1), "loss"
   
   # Optimizer
   optimizer: "adam"
